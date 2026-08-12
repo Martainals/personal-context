@@ -2,12 +2,16 @@
 
 Skill version and database Schema version are independent:
 
-- Skill version: `VERSION` (`0.1.0` for V1)
+- Skill version: `VERSION` (`0.2.0`)
 - Current Schema: `1`
 - Minimum supported Schema: `1`
 - Maximum supported Schema: `1`
+- Consent notice: `1`
+- Provider contract: `1`
 
 `version [--root ...]` reports both declarations and, when supplied, database compatibility.
+
+Skill 0.2.0 adds onboarding and replaceable local transcription without modifying authoritative database tables, so Schema remains 1. Provider provenance is stored in the existing `processing_runs.parameters_json`.
 
 ## Compatibility behavior
 

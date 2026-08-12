@@ -1,0 +1,40 @@
+{
+  "profile_version": 1,
+  "provider": "qwen-mlx",
+  "display_name": "Qwen3-ASR BF16 for Apple Silicon",
+  "platform": {
+    "system": "Darwin",
+    "machine": ["arm64", "aarch64"]
+  },
+  "runtime": {
+    "python": "3.12",
+    "uv": "0.12.3",
+    "packages": [
+      "mlx-audio[stt]==0.4.6"
+    ]
+  },
+  "models": {
+    "asr": {
+      "repo_id": "mlx-community/Qwen3-ASR-1.7B-bf16",
+      "revision": "e1f6c266914abc5a46e8756e02580f834a6cf8a7",
+      "license": "Apache-2.0"
+    },
+    "aligner": {
+      "repo_id": "mlx-community/Qwen3-ForcedAligner-0.6B-bf16",
+      "revision": "53c8c0e46733eec430e4b53dd6471d0e5dee45f8",
+      "license": "Apache-2.0"
+    },
+    "diarizer": {
+      "repo_id": "mlx-community/diar_streaming_sortformer_4spk-v2.1-fp32",
+      "revision": "8541fc3db304f350b544bbcab1cfae4f3eeb2356",
+      "license": "NVIDIA Open Model License"
+    }
+  },
+  "limits": {
+    "maximum_speakers": 4,
+    "asr_chunk_seconds": 240,
+    "diarization_chunk_seconds": 5,
+    "download_estimate_gb": 6.5,
+    "minimum_free_disk_gb": 10
+  }
+}

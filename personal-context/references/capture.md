@@ -32,8 +32,10 @@ Unicode filenames, Chinese text, and paths containing spaces are supported.
 
 Optional top-level arrays are `entities`, `statements`, `decisions`, `actions`, `claims`, `relationships`, and `candidate_memories`. Segment references are zero-based. Relationships require `from`, `to`, and `type`. All source speech also becomes Claim Statements automatically.
 
+An optional top-level `processing` object carries upstream Provider and model provenance. Import preserves it in `processing_runs.parameters_json`; applications must not interpret it as user-authored content.
+
 Use `--source-id` when a transcript describes an already-ingested audio or document Source. Without it, the JSON transcript file itself becomes the immutable Source.
 
 ## Provider boundary
 
-V1 has no transcription provider and does not require a key. A future provider must implement a replaceable adapter, read secrets only from environment variables or private local configuration, use mocks in tests, and emit the structured JSON contract above before database import.
+Skill 0.2.0 includes a local `qwen-mlx` Provider and a universal `transcript-only` profile. Both emit or accept the same contract above. Read `transcription.md` before operating or changing a Provider. Provider code cannot write authoritative database rows directly.

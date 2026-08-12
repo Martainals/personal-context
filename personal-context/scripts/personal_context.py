@@ -650,7 +650,10 @@ def _validate_transcript(data: Any) -> dict[str, Any]:
             "valid_to": normalize_time(event["valid_to"]) if event.get("valid_to") else None,
         },
         "segments": cleaned_segments,
+        "processing": data.get("processing", {}),
     }
+    if not isinstance(cleaned["processing"], dict):
+        raise ContextError("processing must be an object when provided.")
     for collection in ("entities", "statements", "decisions", "actions", "claims", "relationships", "candidate_memories"):
         value = data.get(collection, [])
         if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
@@ -768,14 +771,21 @@ def import_transcript(
     if not source_id:
         ingest(root, [path], observed_at=cleaned["event"]["observed_at"], dry_run=False)
     now = utc_now()
-    run_payload = [effective_source_id, transcript_hash, "structured-transcript-v1"]
+    run_payload = [effective_source_id, transcript_hash, "structured-transcript-v1", cleaned["processing"]]
     run_id = stable_id("run", run_payload)
     segment_ids = [_segment_id(effective_source_id, ordinal, segment) for ordinal, segment in enumerate(cleaned["segments"])]
     with connect(root) as connection, connection:
         connection.execute(
             "INSERT OR IGNORE INTO processing_runs(id, process_type, processor, processor_version, input_hash, "
             "parameters_json, status, started_at, finished_at) VALUES(?, 'import-transcript', 'personal-context', ?, ?, ?, 'completed', ?, ?)",
-            (run_id, skill_version(), transcript_hash, canonical_json({"format": "structured-json-v1"}), now, now),
+            (
+                run_id,
+                skill_version(),
+                transcript_hash,
+                canonical_json({"format": "structured-json-v1", "upstream": cleaned["processing"]}),
+                now,
+                now,
+            ),
         )
         event = cleaned["event"]
         connection.execute(
@@ -1312,6 +1322,8 @@ def version_info(root: Optional[Path]) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "min_supported_schema": MIN_SCHEMA_VERSION,
         "max_supported_schema": MAX_SCHEMA_VERSION,
+        "provider_contract_version": 1,
+        "consent_notice_version": 1,
     }
     if root is not None:
         result["database"] = schema_state(root)
@@ -1327,12 +1339,52 @@ def _add_root(parser: argparse.ArgumentParser, *, required: bool = True) -> None
     parser.add_argument("--root", required=required, help="Personal context vault path (never inferred from source code).")
 
 
+def _add_bootstrap_options(
+    parser: argparse.ArgumentParser, *, require_agent_host: bool = False, include_provider: bool = True
+) -> None:
+    parser.add_argument("--config-dir", help="Private machine configuration; defaults to the operating-system user config directory.")
+    if include_provider:
+        parser.add_argument("--provider", choices=("auto", "transcript-only", "qwen-mlx"), default="auto")
+    parser.add_argument("--agent-host", required=require_agent_host, help="Stable host name such as codex, claude-code, or gemini-cli.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="context", description="Local, auditable personal context management.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     command = subparsers.add_parser("init-vault", help="Initialize an empty V1 data vault.")
     _add_root(command)
+
+    command = subparsers.add_parser("bootstrap-status", help="Read onboarding, consent, database, and local provider state as JSON.")
+    _add_root(command)
+    _add_bootstrap_options(command)
+
+    command = subparsers.add_parser("bootstrap-plan", help="Preview the exact first-use notice, downloads, and local writes.")
+    _add_root(command)
+    _add_bootstrap_options(command, require_agent_host=True)
+    command.add_argument("--mode", choices=("strict-local", "agent-assisted"), required=True)
+
+    command = subparsers.add_parser("record-consent", help="Persist consent only after the user accepts the current bootstrap plan.")
+    _add_root(command)
+    _add_bootstrap_options(command, require_agent_host=True)
+    command.add_argument("--mode", choices=("strict-local", "agent-assisted"), required=True)
+    command.add_argument("--accept-plan", required=True, help="Exact scoped SHA-256 plan digest shown by bootstrap-plan.")
+
+    command = subparsers.add_parser("bootstrap-apply", help="Create the vault and consented isolated local provider runtime.")
+    _add_root(command)
+    _add_bootstrap_options(command)
+
+    command = subparsers.add_parser("provider-doctor", help="Probe provider compatibility and installation without changing state.")
+    _add_bootstrap_options(command)
+
+    command = subparsers.add_parser("transcribe-audio", help="Transcribe one named local audio file to transcript.v1 JSON.")
+    _add_root(command)
+    _add_bootstrap_options(command)
+    command.add_argument("--audio", required=True)
+    command.add_argument("--output", required=True)
+    command.add_argument("--language", help="Optional provider language hint, for example Chinese or English.")
+    command.add_argument("--title")
+    command.add_argument("--observed-at", help="Optional ISO-8601 event observation time.")
 
     command = subparsers.add_parser("doctor", help="Check directories, database integrity, schema, and compatibility.")
     _add_root(command)
@@ -1390,12 +1442,63 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    import personal_context_bootstrap as onboarding
+
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         root = resolve_root(args.root) if getattr(args, "root", None) else None
         if args.command == "init-vault":
             result = init_vault(root)
+        elif args.command == "bootstrap-status":
+            result = onboarding.bootstrap_status(
+                root,
+                config_dir=onboarding.resolve_config_dir(args.config_dir),
+                provider=args.provider,
+                agent_host=args.agent_host,
+                database_state=schema_state(root),
+            )
+        elif args.command == "bootstrap-plan":
+            result = onboarding.bootstrap_plan(
+                root,
+                config_dir=onboarding.resolve_config_dir(args.config_dir),
+                mode=args.mode,
+                provider=args.provider,
+                agent_host=args.agent_host,
+                database_state=schema_state(root),
+            )
+        elif args.command == "record-consent":
+            result = onboarding.record_consent(
+                root,
+                config_dir=onboarding.resolve_config_dir(args.config_dir),
+                mode=args.mode,
+                provider=args.provider,
+                agent_host=args.agent_host,
+                accepted_digest=args.accept_plan,
+            )
+        elif args.command == "bootstrap-apply":
+            result = onboarding.bootstrap_apply(
+                root,
+                config_dir=onboarding.resolve_config_dir(args.config_dir),
+                provider=args.provider,
+                agent_host=args.agent_host,
+                database_state=schema_state(root),
+                init_vault=init_vault,
+            )
+        elif args.command == "provider-doctor":
+            result = onboarding.provider_status(args.provider, onboarding.resolve_config_dir(args.config_dir))
+        elif args.command == "transcribe-audio":
+            result = onboarding.transcribe_audio(
+                root,
+                config_dir=onboarding.resolve_config_dir(args.config_dir),
+                provider=args.provider,
+                agent_host=args.agent_host,
+                audio=Path(args.audio),
+                output=Path(args.output),
+                language=args.language,
+                title=args.title,
+                observed_at=args.observed_at,
+            )
         elif args.command == "doctor":
             result = doctor(root)
         elif args.command == "ingest":
@@ -1425,7 +1528,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 2
         print_json(result)
         return 0
-    except (ContextError, sqlite3.DatabaseError, OSError) as exc:
+    except (ContextError, onboarding.BootstrapError, sqlite3.DatabaseError, OSError) as exc:
         print_json({"error": str(exc), "command": args.command}, stream=sys.stderr)
         return 2
 

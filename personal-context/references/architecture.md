@@ -2,13 +2,23 @@
 
 ## Boundaries
 
-`personal-context` is reusable software and policy. A user-selected vault is private data. The call direction is:
+`personal-context` is reusable software and policy. A user-selected vault and private runtime are user-owned state. The call direction is:
 
 ```text
-User → Codex → personal-context → configured vault
+User → compatible local Agent → personal-context → configured vault
 ```
 
-The vault never invokes the Skill. Every command receives `--root`; the implementation contains no personal absolute path. V1 is local-only and uses Python's standard library plus SQLite.
+The vault never invokes the Skill. Every data command receives `--root`; the implementation contains no personal absolute path. The database control plane uses Python's standard library plus SQLite. Optional model dependencies remain isolated in a Provider subprocess.
+
+## Three layers
+
+```text
+Agent-neutral SKILL.md and JSON CLI
+→ consented private runtime and replaceable Provider
+→ one user-selected SQLite Vault
+```
+
+The private configuration and runtime use the operating-system user configuration directory or explicit `--config-dir`. Model weights, consent receipts, and caches never live in the Git checkout or database.
 
 ## Vault layout
 
@@ -26,9 +36,9 @@ The database and immutable Source blobs are authoritative. `wiki/` and `search_i
 ## Pipeline
 
 ```text
-audio or document in inbox
+explicitly named audio or document
 → immutable Source
-→ timestamped structured transcript
+→ optional local Provider → timestamped structured transcript
 → one Event
 → Statement / Entity / Decision / Action / Claim
 → CandidateMemory
@@ -49,6 +59,6 @@ Capture and long-term memory formation are separate transactions and separate co
 - Repeating the same file or transcript uses unique hashes and stable IDs, producing no duplicate logical records.
 - Bulk operations expose `--dry-run`; migrations require `--apply` after a default dry-run.
 
-## V1 limits
+## Schema 1 limits
 
-V1 does not implement vector databases, voiceprints, file watchers, continuous collection, automatic personality modeling, unreviewed memory promotion, or cloud synchronization. `Hypothesis`, `Pattern`, `Experiment`, and `SelfModelEntry` are reserved concepts only and are never automatically generated.
+Schema 1 does not implement vector databases, voiceprints, file watchers, continuous collection, automatic personality modeling, unreviewed memory promotion, or cloud synchronization. `Hypothesis`, `Pattern`, `Experiment`, and `SelfModelEntry` are reserved concepts only and are never automatically generated.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -9,6 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Optional
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +20,7 @@ FIXTURE = REPO_ROOT / "tests" / "fixtures" / "合成 转录.json"
 sys.path.insert(0, str(SCRIPTS))
 
 import personal_context as pc  # noqa: E402
+import personal_context_bootstrap as onboarding  # noqa: E402
 
 
 def file_hash(path: Path) -> str:
@@ -29,6 +32,7 @@ class PersonalContextTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="personal-context-")
         self.base = Path(self.temp.name)
         self.root = self.base / "中文 路径" / "合成资料库"
+        self.config_dir = self.base / "私有 配置"
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -213,12 +217,232 @@ class PersonalContextTests(unittest.TestCase):
         help_result = subprocess.run([str(entry), "--help"], capture_output=True, text=True, check=False)
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("import-transcript", help_result.stdout)
+        self.assertIn("bootstrap-status", help_result.stdout)
+        self.assertIn("transcribe-audio", help_result.stdout)
         failure = subprocess.run(
             [str(entry), "doctor", "--root", str(self.root)], capture_output=True, text=True, check=False
         )
         self.assertEqual(failure.returncode, 0)
         payload = json.loads(failure.stdout)
         self.assertFalse(payload["ok"])
+
+    def test_bootstrap_plan_is_read_only_and_consent_digest_is_required(self) -> None:
+        state = pc.schema_state(self.root)
+        plan = onboarding.bootstrap_plan(
+            self.root,
+            config_dir=self.config_dir,
+            mode="strict-local",
+            provider="transcript-only",
+            agent_host="test-agent",
+            database_state=state,
+        )
+        self.assertTrue(plan["dry_run"])
+        self.assertFalse(self.root.exists())
+        self.assertFalse(self.config_dir.exists())
+        with self.assertRaises(onboarding.BootstrapError):
+            onboarding.record_consent(
+                self.root,
+                config_dir=self.config_dir,
+                mode="strict-local",
+                provider="transcript-only",
+                agent_host="test-agent",
+                accepted_digest="stale",
+            )
+        with self.assertRaises(onboarding.BootstrapError):
+            onboarding.record_consent(
+                self.root,
+                config_dir=self.config_dir,
+                mode="agent-assisted",
+                provider="transcript-only",
+                agent_host="test-agent",
+                accepted_digest=plan["plan_digest"],
+            )
+        result = onboarding.record_consent(
+            self.root,
+            config_dir=self.config_dir,
+            mode="strict-local",
+            provider="transcript-only",
+            agent_host="test-agent",
+            accepted_digest=plan["plan_digest"],
+        )
+        receipt = Path(result["receipt"])
+        self.assertTrue(receipt.is_file())
+        if os.name != "nt":
+            self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+        status = onboarding.bootstrap_status(
+            self.root,
+            config_dir=self.config_dir,
+            provider="auto",
+            agent_host="another-agent",
+            database_state=pc.schema_state(self.root),
+        )
+        self.assertEqual(status["provider"], "transcript-only")
+        self.assertEqual(status["status"], "needs_vault")
+
+    def test_bootstrap_apply_creates_one_vault_and_is_idempotent(self) -> None:
+        onboarding.record_consent(
+            self.root,
+            config_dir=self.config_dir,
+            mode="strict-local",
+            provider="transcript-only",
+            agent_host="test-agent",
+            accepted_digest=onboarding.consent_scope_digest(
+                self.root, provider="transcript-only", mode="strict-local", agent_host="test-agent"
+            ),
+        )
+        applied = onboarding.bootstrap_apply(
+            self.root,
+            config_dir=self.config_dir,
+            provider="auto",
+            agent_host="different-agent",
+            database_state=pc.schema_state(self.root),
+            init_vault=pc.init_vault,
+        )
+        self.assertEqual(applied["status"], "ready")
+        self.assertTrue(pc.doctor(self.root)["ok"])
+        repeated = onboarding.bootstrap_apply(
+            self.root,
+            config_dir=self.config_dir,
+            provider="auto",
+            agent_host="different-agent",
+            database_state=pc.schema_state(self.root),
+            init_vault=pc.init_vault,
+        )
+        self.assertEqual(repeated["database"]["status"], "already_initialized")
+        status = onboarding.bootstrap_status(
+            self.root,
+            config_dir=self.config_dir,
+            provider="auto",
+            agent_host="different-agent",
+            database_state=pc.schema_state(self.root),
+        )
+        self.assertEqual(status["status"], "ready")
+
+    def test_agent_assisted_consent_is_scoped_to_named_host(self) -> None:
+        self.init()
+        onboarding.record_consent(
+            self.root,
+            config_dir=self.config_dir,
+            mode="agent-assisted",
+            provider="transcript-only",
+            agent_host="codex",
+            accepted_digest=onboarding.consent_scope_digest(
+                self.root, provider="transcript-only", mode="agent-assisted", agent_host="codex"
+            ),
+        )
+        same = onboarding.bootstrap_status(
+            self.root,
+            config_dir=self.config_dir,
+            provider="auto",
+            agent_host="codex",
+            database_state=pc.schema_state(self.root),
+        )
+        changed = onboarding.bootstrap_status(
+            self.root,
+            config_dir=self.config_dir,
+            provider="auto",
+            agent_host="claude-code",
+            database_state=pc.schema_state(self.root),
+        )
+        self.assertEqual(same["status"], "ready")
+        self.assertEqual(changed["status"], "needs_consent")
+        self.assertEqual(changed["consent"]["reason"], "agent_host_changed")
+
+    def test_provider_provenance_is_preserved_without_schema_change(self) -> None:
+        self.init()
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["processing"] = {
+            "provider": "synthetic-local",
+            "models": {"asr": {"revision": "abc123"}},
+        }
+        transcript = self.base / "provider transcript.json"
+        transcript.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        pc.import_transcript(self.root, transcript, source_id=None, dry_run=False)
+        with pc.connect(self.root, readonly=True) as connection:
+            row = connection.execute("SELECT parameters_json FROM processing_runs").fetchone()
+            parameters = json.loads(row[0])
+            schema = pc.read_schema_version(connection)
+        self.assertEqual(schema, 1)
+        self.assertEqual(parameters["upstream"]["provider"], "synthetic-local")
+        self.assertEqual(parameters["upstream"]["models"]["asr"]["revision"], "abc123")
+
+    def test_transcribe_command_returns_metadata_not_transcript_text(self) -> None:
+        audio = self.base / "private recording.m4a"
+        audio.write_bytes(b"synthetic-audio")
+        output = self.base / "private transcript.json"
+        compatible = {
+            "system": "Darwin",
+            "machine": "arm64",
+            "python": "3.9.0",
+            "qwen_mlx_compatible": True,
+            "qwen_mlx_reason": None,
+        }
+        with mock.patch.object(onboarding, "platform_probe", return_value=compatible):
+            onboarding.record_consent(
+                self.root,
+                config_dir=self.config_dir,
+                mode="strict-local",
+                provider="qwen-mlx",
+                agent_host="codex",
+                accepted_digest=onboarding.consent_scope_digest(
+                    self.root, provider="qwen-mlx", mode="strict-local", agent_host="codex"
+                ),
+            )
+
+        def fake_run(command: list[str], *, env: Optional[dict[str, str]] = None) -> None:
+            del command, env
+            output.write_text(
+                json.dumps(
+                    {
+                        "segments": [{"text": "高度敏感的正文"}],
+                        "processing": {
+                            "provider": "qwen-mlx",
+                            "source_audio_sha256": file_hash(audio),
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+        ready = {"provider": "qwen-mlx", "compatible": True, "installed": True, "ready": True}
+        with mock.patch.object(onboarding, "provider_status", return_value=ready), mock.patch.object(
+            onboarding, "_run_checked", side_effect=fake_run
+        ):
+            result = onboarding.transcribe_audio(
+                self.root,
+                config_dir=self.config_dir,
+                provider="auto",
+                agent_host="unrelated-host",
+                audio=audio,
+                output=output,
+                language="Chinese",
+                title=None,
+                observed_at=None,
+            )
+        rendered = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("高度敏感的正文", rendered)
+        self.assertFalse(result["text_exposed_to_agent"])
+        self.assertEqual(result["bytes"], output.stat().st_size)
+
+    def test_qwen_provider_profile_is_locked_and_lazy_loads_optional_dependencies(self) -> None:
+        manifest = onboarding.load_manifest()
+        self.assertEqual(manifest["provider"], "qwen-mlx")
+        self.assertEqual(manifest["runtime"]["packages"], ["mlx-audio[stt]==0.4.6"])
+        for model in manifest["models"].values():
+            revision = model["revision"]
+            self.assertEqual(len(revision), 40)
+            self.assertTrue(all(character in "0123456789abcdef" for character in revision))
+            self.assertTrue(model["license"])
+        help_result = subprocess.run(
+            [sys.executable, str(SCRIPTS / "providers" / "qwen_mlx.py"), "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(help_result.returncode, 0)
+        self.assertIn("download", help_result.stdout)
+        self.assertIn("transcribe", help_result.stdout)
 
 
 if __name__ == "__main__":

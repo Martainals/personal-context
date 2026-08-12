@@ -1,4 +1,4 @@
 interface:
   display_name: "个人上下文"
-  short_description: "安全采集、审核、检索、追溯并维护本地个人上下文数据库"
-  default_prompt: "使用 $personal-context 安全地采集、审核或检索我的个人上下文。"
+  short_description: "初始化本地数据库，转录录音并审核可追溯的个人上下文"
+  default_prompt: "使用 $personal-context 检查首次许可状态，并安全处理我的本地个人上下文。"

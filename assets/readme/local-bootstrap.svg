@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">personal-context 的跨 Agent 本地自举架构</title>
+  <desc id="desc">兼容 Agent 先执行许可状态机，再建立私有本地转录环境和唯一 SQLite Vault；模型只产生结构化转录，长期记忆仍由用户审核。</desc>
+
+  <rect width="1200" height="520" rx="26" fill="#0d1726"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif">
+    <text x="56" y="48" fill="#5dd8c6" font-size="13" font-weight="700" letter-spacing="2">ONE SKILL · ANY LOCAL AGENT · ONE VAULT</text>
+    <text x="56" y="88" fill="#f2f6f7" font-size="34" font-weight="760">先取得许可，再建立能力</text>
+    <text x="56" y="118" fill="#9eacbd" font-size="16">宿主可以变化；许可状态、Provider 协议和证据数据库保持稳定。</text>
+
+    <g transform="translate(56 160)">
+      <path d="M224 104H272M510 104H558M796 104H844" stroke="#64748b" stroke-width="2"/>
+      <path d="M263 98L273 104L263 110M549 98L559 104L549 110M835 98L845 104L835 110" fill="none" stroke="#9eacbd" stroke-width="2"/>
+
+      <g>
+        <rect width="224" height="208" rx="16" fill="#142537" stroke="#39536c"/>
+        <text x="20" y="31" fill="#8ea0b8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">01 / HOST</text>
+        <text x="20" y="67" fill="#f2f6f7" font-size="20" font-weight="700">兼容本地 Agent</text>
+        <rect x="20" y="88" width="184" height="32" rx="8" fill="#0d1726"/>
+        <text x="112" y="109" text-anchor="middle" fill="#c7d2df" font-size="13">Codex · Claude Code</text>
+        <rect x="20" y="128" width="184" height="32" rx="8" fill="#0d1726"/>
+        <text x="112" y="149" text-anchor="middle" fill="#c7d2df" font-size="13">Gemini CLI · others</text>
+        <text x="20" y="187" fill="#8ea0b8" font-size="12">SKILL.md + JSON CLI</text>
+      </g>
+
+      <g transform="translate(286)">
+        <rect width="224" height="208" rx="16" fill="#2a2417" stroke="#d7ad55"/>
+        <text x="20" y="31" fill="#d7ad55" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">02 / CONSENT</text>
+        <text x="20" y="67" fill="#fff2cf" font-size="20" font-weight="700">确定性状态机</text>
+        <text x="20" y="101" fill="#dec98e" font-size="13">status → plan → user</text>
+        <text x="20" y="126" fill="#dec98e" font-size="13">digest → receipt → apply</text>
+        <path d="M20 148H204" stroke="#d7ad55" stroke-opacity=".4"/>
+        <text x="20" y="177" fill="#fff2cf" font-size="12">无许可，不下载、不初始化</text>
+        <text x="20" y="196" fill="#a99667" font-size="11">scope changes → ask again</text>
+      </g>
+
+      <g transform="translate(572)">
+        <rect width="224" height="208" rx="16" fill="#12312f" stroke="#5dd8c6"/>
+        <text x="20" y="31" fill="#5dd8c6" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">03 / PRIVATE RUNTIME</text>
+        <text x="20" y="67" fill="#d9fff8" font-size="20" font-weight="700">可替换 Provider</text>
+        <text x="20" y="101" fill="#a7ded5" font-size="13">Qwen3-ASR 1.7B BF16</text>
+        <text x="20" y="126" fill="#a7ded5" font-size="13">ForcedAligner + Sortformer</text>
+        <path d="M20 148H204" stroke="#5dd8c6" stroke-opacity=".35"/>
+        <text x="20" y="177" fill="#d9fff8" font-size="12">audio → transcript.v1.json</text>
+        <text x="20" y="196" fill="#75aa9f" font-size="11">no daemon · no cloud fallback</text>
+      </g>
+
+      <g transform="translate(858)">
+        <rect width="224" height="208" rx="16" fill="#eef4f6"/>
+        <text x="20" y="31" fill="#526275" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">04 / ONE VAULT</text>
+        <text x="20" y="67" fill="#152333" font-size="20" font-weight="700">SQLite + Source</text>
+        <text x="20" y="101" fill="#526275" font-size="13">Segment / Claim / Event</text>
+        <text x="20" y="126" fill="#526275" font-size="13">CandidateMemory / Review</text>
+        <path d="M20 148H204" stroke="#8b9bab" stroke-opacity=".55"/>
+        <text x="20" y="177" fill="#193f36" font-size="12" font-weight="700">用户批准后才是 Memory</text>
+        <text x="20" y="196" fill="#6c7a88" font-size="11">Schema 1 · auditable</text>
+      </g>
+    </g>
+
+    <g transform="translate(56 405)">
+      <rect width="1082" height="70" rx="14" fill="#172335"/>
+      <circle cx="24" cy="25" r="6" fill="#5dd8c6"/>
+      <text x="42" y="30" fill="#d9fff8" font-size="13" font-weight="700">STRICT LOCAL</text>
+      <text x="153" y="30" fill="#8ea0b8" font-size="13">Agent 不读取转录正文</text>
+      <path d="M388 14V56" stroke="#415269"/>
+      <circle cx="420" cy="25" r="6" fill="#f5c56b"/>
+      <text x="438" y="30" fill="#fff2cf" font-size="13" font-weight="700">AGENT ASSISTED</text>
+      <text x="584" y="30" fill="#8ea0b8" font-size="13">仅许可的 Agent host 可整理正文</text>
+      <text x="24" y="53" fill="#64748b" font-size="11">两种模式都不会自动批准长期记忆；切换模式、Provider、Vault 或 host 必须重新确认。</text>
+    </g>
+  </g>
+</svg>
