@@ -1,0 +1,4 @@
+interface:
+  display_name: "个人上下文"
+  short_description: "安全采集、审核、检索、追溯并维护本地个人上下文数据库"
+  default_prompt: "使用 $personal-context 安全地采集、审核或检索我的个人上下文。"

@@ -1,0 +1,19 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Personal context vault data must never enter this source repository.
+**/context.sqlite3
+**/context.sqlite3-*
+**/blobs/
+**/inbox/
+**/wiki/
+**/backups/
+
+# Local environments and editor state.
+.venv/
+venv/
+.idea/
+.vscode/

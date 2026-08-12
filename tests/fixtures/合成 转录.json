@@ -1,0 +1,55 @@
+{
+  "event": {
+    "title": "灯塔项目周会",
+    "type": "project-meeting",
+    "observed_at": "2026-08-10T09:30:00+08:00"
+  },
+  "segments": [
+    {
+      "start_ms": 0,
+      "end_ms": 4200,
+      "speaker": "林舟",
+      "text": "我认为测试环境已经稳定，我们决定周五发布。"
+    },
+    {
+      "start_ms": 4300,
+      "end_ms": 7100,
+      "speaker": "陈晓",
+      "text": "我会在周四准备发布检查表。"
+    }
+  ],
+  "entities": [
+    {"name": "灯塔项目", "type": "Project", "segment": 0},
+    {"name": "林舟", "type": "Person", "segment": 0},
+    {"name": "陈晓", "type": "Person", "segment": 1}
+  ],
+  "statements": [
+    {"kind": "Opinion", "speaker": "林舟", "text": "测试环境已经稳定", "segment": 0}
+  ],
+  "decisions": [
+    {"text": "灯塔项目周五发布", "decided_by": "林舟", "segment": 0}
+  ],
+  "actions": [
+    {"text": "准备发布检查表", "assignee": "陈晓", "status": "open", "segment": 1}
+  ],
+  "claims": [
+    {"text": "测试环境已经稳定", "claimant": "林舟", "status": "reported", "segment": 0}
+  ],
+  "relationships": [
+    {"from": "陈晓", "to": "灯塔项目", "type": "contributes-to", "segment": 1}
+  ],
+  "candidate_memories": [
+    {
+      "content": "灯塔项目计划周五发布",
+      "kind": "Decision",
+      "segment": 0,
+      "rationale": "会议中的明确决定"
+    },
+    {
+      "content": "陈晓负责准备发布检查表",
+      "kind": "Action",
+      "segment": 1,
+      "rationale": "会议中的明确承诺"
+    }
+  ]
+}
