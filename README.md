@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="Skill version 0.4.0" src="https://img.shields.io/badge/skill-0.4.0-0f766e?style=flat-square">
+  <img alt="Skill version 0.5.0" src="https://img.shields.io/badge/skill-0.5.0-0f766e?style=flat-square">
   <img alt="Schema version 1" src="https://img.shields.io/badge/schema-1-b7791f?style=flat-square">
   <img alt="Agent Skills open format" src="https://img.shields.io/badge/format-Agent%20Skills-334155?style=flat-square">
   <img alt="Python 3.9 or newer" src="https://img.shields.io/badge/core-Python%203.9%2B-334155?style=flat-square">
@@ -20,6 +20,7 @@
 - 用摘要锁定用户明确同意的范围，随后建立唯一 SQLite Vault；
 - 在 Apple Silicon 上部署隔离的 Qwen3-ASR BF16 本地转写环境；
 - 按 ASR、逐词对齐、原始说话人概率、发言轮次和最终组装分阶段缓存，重复或中断的录音只重算缺失部分；
+- 把正常录音交付为 Vault `inbox` 中唯一、完整、可读且防误覆盖的 Markdown；
 - 将录音或文档变成不可变 Source、带时间的 Segment 与默认 Claim；
 - 审核 CandidateMemory 后才形成长期 Memory；
 - 以来源哈希、观察时间和录音时间范围检索、审计并重新编译 Wiki；
@@ -37,6 +38,7 @@
 | 本地转录没有静默云端降级 | `qwen-mlx` 失败就停止；不自动改用 API |
 | 模型环境不污染系统 | 私有 Python、虚拟环境、缓存和模型均位于用户配置目录 |
 | 转写中断不必从头开始 | 校验和保护的 JSON/gzip 阶段产物按录音和 Vault 隔离，损坏只重算对应分块 |
+| 内部 JSON 不污染 inbox | `transcript.v1` 只在私有临时 job 中连接 Provider 与数据库，成功或失败后均清理 |
 | 原始证据不可静默修改 | Source 按 SHA-256 寻址；Source 与 Segment 受 SQLite 触发器保护 |
 | “某人说过”不等于“事实” | 每个语音 Segment 默认形成 `Claim` |
 | 采集不等于形成长期记忆 | 只有显式 `approve` 才创建 `Memory` |
@@ -125,42 +127,26 @@ CONTEXT_ROOT="/path/to/personal-context-vault"
 
 ## 直接发送一段录音之后
 
-Agent 应将录音落为一个明确的本地文件路径，再运行：
+Agent 应将录音落为一个明确的本地文件路径，再使用高层交付命令：
 
 ```bash
-# 1. 原始录音成为不可变 Source
-./personal-context/scripts/context ingest \
-  --root "$CONTEXT_ROOT" --dry-run /path/to/recording.m4a
-
-./personal-context/scripts/context ingest \
-  --root "$CONTEXT_ROOT" /path/to/recording.m4a
-
-# 2. 本地 ASR、时间对齐和最多四人的说话人分离
-./personal-context/scripts/context transcribe-audio \
+./personal-context/scripts/context capture-audio \
   --root "$CONTEXT_ROOT" \
   --agent-host codex \
   --audio /path/to/recording.m4a \
-  --output /private/path/recording.transcript.json \
   --language Chinese \
   --speaker-count 2
-
-# 3. 使用 ingest 返回的 source_id 预览并导入同一数据库
-./personal-context/scripts/context import-transcript \
-  --root "$CONTEXT_ROOT" \
-  --source-id '<source-id>' \
-  --dry-run /private/path/recording.transcript.json
-
-./personal-context/scripts/context import-transcript \
-  --root "$CONTEXT_ROOT" \
-  --source-id '<source-id>' \
-  /private/path/recording.transcript.json
 ```
 
-`transcribe-audio` 的标准输出只包含文件路径、哈希和大小，不打印转录正文。严格本地模式下，Agent 可以直接完成导入而不读取正文。
+命令会依次预检原音频、在私有 job 中生成并验证 `transcript.v1`、采集原音频 Source、原子导入证据，最后才把 `<audio-stem>-录音转写.md` 原子发布到 `inbox/`。成功后 job JSON 删除；Provider、渲染或导入失败时，inbox 不出现 JSON 或半成品。标准输出只含 ID、计数、Markdown 元数据及 Provider/cache 元数据，不打印正文。
+
+Markdown 包含标题、完整状态、总时长、人物标签与按 `HH:MM:SS` 排序的全部逐字稿。不可见完整性标记允许安全重跑；如果用户编辑过文件，系统拒绝覆盖并保留原件。
 
 `--speaker-count` 是单次录音的可选提示；确定人数时应显式填写 1–4，不确定时省略并自动检测。已录完的文件默认使用高上下文 Sortformer 配置，再依据整段录音的置信度统一说话人通道、清除短暂跳变并组装发言轮次。
 
-重复处理同一录音时默认复用私有阶段产物。标题、观察时间、人数提示和说话人后处理调整不会让 ASR 或逐词对齐失效；人数与后处理会从已缓存的原始说话人概率重新派生。需要诊断时可以绕过缓存或只刷新一个阶段：
+重复处理同一录音时默认复用私有阶段产物，并用稳定 ID 避免重复 Source、Event 和 Segment。标题、观察时间、人数提示和说话人后处理调整不会让 ASR 或逐词对齐失效；人数与后处理会从已缓存的原始说话人概率重新派生。
+
+`transcribe-audio --output <json>` 保留为调试和第三方集成的低层接口，不是正常 Skill 交付路径。需要诊断时可以绕过缓存或只刷新一个阶段：
 
 ```bash
 # 完全绕过本次缓存读写
@@ -223,7 +209,7 @@ Vault 由用户选择，是唯一权威数据层：
 <vault>/
 ├── context.sqlite3
 ├── blobs/          # 不可变 Source
-├── inbox/
+├── inbox/          # 正常录音交付：每段录音一个完整 Markdown
 ├── wiki/           # 可重建阅读视图
 └── backups/
 ```
@@ -244,14 +230,14 @@ Vault 由用户选择，是唯一权威数据层：
 
 | 项目 | 当前值 |
 |---|---|
-| Skill | `0.4.0` |
+| Skill | `0.5.0` |
 | SQLite Schema | `1` |
 | Consent notice | `2` |
 | Provider contract | `1` |
 | Artifact contract | `1` |
 | qwen-mlx profile | `3` |
 
-0.4.0 新增的是数据库外的可丢弃转写阶段产物，不改变权威数据库表或 `transcript.v1`，因此 Schema 与 Provider contract 都保持 1。Notice 升至 2，已有许可会失效并要求用户重新确认持久缓存路径、内容和手动清理规则。
+0.5.0 只增加高层交付编排和 Markdown 派生文件，不改变 Schema、Provider/transcript contract、Artifact contract、Qwen profile 或 Notice，因此无需迁移数据库、重装模型或更新许可收据。
 
 项目根目录的 [`AGENTS.md`](./AGENTS.md) 是后续 Agent 开发和升级的唯一维护章程。`CLAUDE.md`、`GEMINI.md` 只引用它，避免多份规则漂移；Codex 的 `personal-context/agents/openai.yaml` 仅是可选界面元数据。
 
@@ -280,6 +266,7 @@ PYTHONPYCACHEPREFIX=/tmp/personal-context-pycache \
 │   │   ├── context
 │   │   ├── personal_context.py
 │   │   ├── personal_context_bootstrap.py
+│   │   ├── transcript_markdown.py
 │   │   └── providers/
 │   │       ├── qwen_mlx.py
 │   │       ├── artifacts.py

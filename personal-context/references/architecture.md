@@ -18,7 +18,7 @@ Agent-neutral SKILL.md and JSON CLI
 → one user-selected SQLite Vault
 ```
 
-The private configuration and runtime use the operating-system user configuration directory or explicit `--config-dir`. Model weights, consent receipts, and caches never live in the Git checkout or database.
+The private configuration and runtime use the operating-system user configuration directory or explicit `--config-dir`. Model weights, consent receipts, caches, and transient capture jobs never live in the Git checkout or database.
 
 ## Vault layout
 
@@ -26,22 +26,24 @@ The private configuration and runtime use the operating-system user configuratio
 <root>/
 ├── context.sqlite3     # authoritative structured database
 ├── blobs/              # immutable, SHA-256-addressed Source bytes
-├── inbox/              # optional user staging area
+├── inbox/              # completed human-readable deliveries only
 ├── wiki/               # generated human-readable view
 └── backups/            # migration backups
 ```
 
-The database and immutable Source blobs are authoritative. `wiki/` and `search_index` are disposable compiled views.
+The database and immutable Source blobs are authoritative. `inbox/*-录音转写.md`, `wiki/`, and `search_index` are derived human-readable views. Normal audio capture never persists `transcript.v1` JSON in the Vault.
 
 ## Pipeline
 
 ```text
-explicitly named audio or document
+explicitly named audio
+→ private transient job → local Provider → transcript.v1 → validated Markdown staging
 → immutable Source
-→ optional local Provider → timestamped structured transcript
+→ atomic transcript import
 → one Event
 → Statement / Entity / Decision / Action / Claim
 → CandidateMemory
+→ atomic inbox Markdown publication → transient job cleanup
 → explicit user review
 → approved Memory
 → compiled Wiki
@@ -50,6 +52,8 @@ explicitly named audio or document
 
 Capture and long-term memory formation are separate transactions and separate commands. Structured transcript import never approves memory.
 
+`capture-audio` orders work so Provider and Markdown validation happen before database writes, transcript import commits before inbox publication, and the job directory is removed on every exit. An import failure can leave only the already-verified immutable audio Source; it cannot leave a partial Event or inbox delivery. If final publication fails after import, stable IDs make a retry safe. A manually edited generated Markdown fails integrity preflight before Provider or database work and is never replaced.
+
 ## Determinism and transactions
 
 - Source IDs derive from SHA-256 content hashes.
@@ -57,6 +61,7 @@ Capture and long-term memory formation are separate transactions and separate co
 - Source content is copied to a content-addressed blob and verified before its database row is committed.
 - A transcript batch is validated before its transaction begins; all derived rows commit or roll back together.
 - Repeating the same file or transcript uses unique hashes and stable IDs, producing no duplicate logical records.
+- Markdown uses same-directory temporary files, `fsync`, atomic replacement, and a generated-body hash. Only an unedited generated file for the same audio hash can be updated.
 - Bulk operations expose `--dry-run`; migrations require `--apply` after a default dry-run.
 
 ## Schema 1 limits

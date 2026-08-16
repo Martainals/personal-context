@@ -17,6 +17,15 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
+from transcript_markdown import (
+    ManualEditError,
+    TranscriptMarkdownError,
+    assert_safe_to_publish,
+    load_transcript,
+    publish_markdown,
+    render_transcript_markdown,
+)
+
 
 SCHEMA_VERSION = 1
 MIN_SCHEMA_VERSION = 1
@@ -914,6 +923,168 @@ def import_transcript(
     return {"dry_run": False, "source_id": effective_source_id, "event_id": event_id, "counts": counts}
 
 
+def _capture_observed_at(root: Path, source_id: str, audio_path: Path) -> str:
+    with connect(root, readonly=True) as connection:
+        existing = connection.execute(
+            "SELECT observed_at FROM sources WHERE id=?", (source_id,)
+        ).fetchone()
+    if existing:
+        return str(existing[0])
+    timestamp = dt.datetime.fromtimestamp(audio_path.stat().st_mtime, tz=dt.timezone.utc)
+    return timestamp.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _existing_event_matches(
+    root: Path, event_id: str, source_id: str, transcript: dict[str, Any]
+) -> Optional[bool]:
+    cleaned = _validate_transcript(transcript)
+    expected = [
+        {
+            "ordinal": ordinal,
+            "start_ms": item["start_ms"],
+            "end_ms": item["end_ms"],
+            "speaker": item["speaker"],
+            "text": item["text"],
+        }
+        for ordinal, item in enumerate(cleaned["segments"])
+    ]
+    with connect(root, readonly=True) as connection:
+        event = connection.execute(
+            "SELECT source_id FROM events WHERE id=?", (event_id,)
+        ).fetchone()
+        if event is None:
+            return None
+        if event[0] != source_id:
+            return False
+        actual = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT ordinal, start_ms, end_ms, speaker, text FROM segments "
+                "WHERE event_id=? ORDER BY ordinal",
+                (event_id,),
+            ).fetchall()
+        ]
+    return actual == expected
+
+
+def capture_audio(
+    root: Path,
+    *,
+    config_dir: Path,
+    provider: str,
+    agent_host: Optional[str],
+    audio: Path,
+    language: Optional[str],
+    title: Optional[str],
+    observed_at: Optional[str],
+    speaker_count: Optional[int] = None,
+) -> dict[str, Any]:
+    """Capture one audio Source, import evidence, and publish only complete Markdown."""
+    import personal_context_bootstrap as onboarding
+
+    root = root.expanduser().resolve()
+    config_dir = config_dir.expanduser().resolve()
+    health = doctor(root)
+    if not health["ok"]:
+        raise ContextError("Vault is not ready for capture-audio; run doctor and repair it first.")
+    audio_path = audio.expanduser().resolve()
+    if not audio_path.is_file():
+        raise ContextError(f"Input is not a file: {audio_path}")
+
+    preview = ingest(root, [audio_path], observed_at=observed_at, dry_run=True)["items"][0]
+    source_id = str(preview["source_id"])
+    source_hash = str(preview["content_hash"])
+    effective_observed_at = normalize_time(observed_at) if observed_at else _capture_observed_at(
+        root, source_id, audio_path
+    )
+    output_name = f"{audio_path.stem or '录音'}-录音转写.md"
+    inbox_path = root / "inbox"
+    if inbox_path.is_symlink():
+        raise ContextError("Vault inbox must be a real directory, not a symbolic link.")
+    output_path = inbox_path / output_name
+    try:
+        assert_safe_to_publish(output_path, source_audio_sha256=source_hash)
+    except ManualEditError as exc:
+        raise ContextError(str(exc)) from exc
+
+    jobs_root = config_dir / "capture-jobs"
+    jobs_root.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(config_dir, 0o700)
+        os.chmod(jobs_root, 0o700)
+    with tempfile.TemporaryDirectory(prefix="capture-audio-", dir=jobs_root) as job_name:
+        job_dir = Path(job_name)
+        if os.name != "nt":
+            os.chmod(job_dir, 0o700)
+        transcript_path = job_dir / "transcript.v1.json"
+        staged_markdown_path = job_dir / "delivery.md"
+        transcribe_result = onboarding.transcribe_audio(
+            root,
+            config_dir=config_dir,
+            provider=provider,
+            agent_host=agent_host,
+            audio=audio_path,
+            output=transcript_path,
+            language=language,
+            title=title,
+            observed_at=effective_observed_at,
+            speaker_count=speaker_count,
+        )
+        if not transcript_path.is_file():
+            raise ContextError("Transcription completed without private transcript.v1 output.")
+        if os.name != "nt":
+            os.chmod(transcript_path, 0o600)
+        try:
+            transcript = load_transcript(transcript_path)
+            processing = transcript.get("processing")
+            if not isinstance(processing, dict) or processing.get("source_audio_sha256") != source_hash:
+                raise TranscriptMarkdownError("Transcript source audio hash does not match the named audio")
+            rendered = render_transcript_markdown(
+                transcript, source_audio_sha256=source_hash
+            )
+            publish_markdown(staged_markdown_path, rendered)
+        except TranscriptMarkdownError as exc:
+            raise ContextError(str(exc)) from exc
+
+        ingest(root, [audio_path], observed_at=effective_observed_at, dry_run=False)
+        import_preview = import_transcript(
+            root, transcript_path, source_id=source_id, dry_run=True
+        )
+        event_id = str(import_preview["event_id"])
+        existing_match = _existing_event_matches(root, event_id, source_id, transcript)
+        if existing_match is False:
+            raise ContextError(
+                "The existing event differs from this transcript; refusing to add duplicate immutable segments."
+            )
+        if existing_match is None:
+            imported = import_transcript(
+                root, transcript_path, source_id=source_id, dry_run=False
+            )
+        else:
+            imported = {
+                "source_id": source_id,
+                "event_id": event_id,
+                "counts": import_preview["counts"],
+            }
+        try:
+            markdown = publish_markdown(output_path, rendered)
+        except TranscriptMarkdownError as exc:
+            raise ContextError(str(exc)) from exc
+
+    counts = {"events": 1, **imported["counts"]}
+    return {
+        "status": "captured",
+        "source_id": source_id,
+        "event_id": imported["event_id"],
+        "counts": counts,
+        "markdown": markdown,
+        "provider": transcribe_result.get("provider"),
+        "cache": transcribe_result.get("cache"),
+        "mode": transcribe_result.get("mode"),
+        "text_exposed_to_agent": False,
+    }
+
+
 def _rows(connection: sqlite3.Connection, sql: str, parameters: Sequence[Any] = ()) -> list[dict[str, Any]]:
     return [dict(row) for row in connection.execute(sql, parameters).fetchall()]
 
@@ -1400,6 +1571,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     command = subparsers.add_parser(
+        "capture-audio",
+        help="Capture audio evidence and deliver one complete Markdown transcript to the Vault inbox.",
+    )
+    _add_root(command)
+    _add_bootstrap_options(command)
+    command.add_argument("--audio", required=True)
+    command.add_argument("--language", help="Optional provider language hint, for example Chinese or English.")
+    command.add_argument(
+        "--speaker-count",
+        type=int,
+        choices=range(1, 5),
+        help="Known number of speakers in this recording; omit to auto-detect up to four.",
+    )
+    command.add_argument("--title")
+    command.add_argument("--observed-at", help="Optional ISO-8601 event observation time.")
+
+    command = subparsers.add_parser(
         "transcription-cache-status",
         help="Inspect private transcription artifact metadata without exposing transcript text.",
     )
@@ -1533,6 +1721,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 speaker_count=args.speaker_count,
                 no_cache=args.no_cache,
                 refresh_stage=args.refresh_stage,
+            )
+        elif args.command == "capture-audio":
+            result = capture_audio(
+                root,
+                config_dir=onboarding.resolve_config_dir(args.config_dir),
+                provider=args.provider,
+                agent_host=args.agent_host,
+                audio=Path(args.audio),
+                language=args.language,
+                title=args.title,
+                observed_at=args.observed_at,
+                speaker_count=args.speaker_count,
             )
         elif args.command == "transcription-cache-status":
             result = onboarding.transcription_cache_status(

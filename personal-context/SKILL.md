@@ -40,22 +40,16 @@ scripts/context bootstrap-status --root <vault> --agent-host <host>
 `qwen-mlx` 仅在 macOS Apple Silicon 上提供本地高精度转写；其他环境使用 `transcript-only`，直到安装受支持的 Provider。详细模型、限制和输出协议见 `references/transcription.md`。
 
 ```bash
-# 原音频先作为不可变 Source 预览并采集
-scripts/context ingest --root <vault> --dry-run <audio>
-scripts/context ingest --root <vault> <audio>
-
-# 本地转写只返回文件元数据，不在 stdout 打印转录正文
-scripts/context transcribe-audio \
+# 用户要求录音转写时使用默认高层交付入口
+scripts/context capture-audio \
   --root <vault> --agent-host <host> \
-  --audio <audio> --output <transcript.json> --language Chinese \
+  --audio <audio> --language Chinese \
   --speaker-count 2
-
-# 使用上一步 ingest 返回的 source_id，先预览后导入同一个数据库
-scripts/context import-transcript --root <vault> --source-id <source-id> --dry-run <transcript.json>
-scripts/context import-transcript --root <vault> --source-id <source-id> <transcript.json>
 ```
 
-在 `strict-local` 模式下，不读取或复述 transcript 文件正文；直接通过命令导入。`agent-assisted` 模式下，只有许可记录中命名的 Agent host 可以读取正文并补充 Entity、Decision、Action 与 CandidateMemory。Provider 只负责转写，不自动制造长期记忆。
+`capture-audio` 在私有临时 job 中处理内部 `transcript.v1`，采集原音频 Source、原子导入证据，最后只向 `<vault>/inbox/` 发布 `<audio-stem>-录音转写.md`；正常成功后删除 job JSON。最终回复把该 Markdown 路径作为主要交付，不提供内部 JSON。在 `strict-local` 模式下，不读取、复述或打印转录正文。Provider 只负责转写，本流程不生成总结，不形成或批准长期 Memory。
+
+`transcribe-audio --output <transcript.json>` 与手工 `ingest` / `import-transcript` 仅用于调试和第三方集成，不用于普通录音请求。完整发布顺序、失败恢复和人工编辑保护见 `references/capture.md`。
 
 `--speaker-count` 只是本次录音的 1–4 人提示；用户确定人数时应传入，不确定时省略。不得把一次录音的标签当成跨录音声纹身份。
 
@@ -111,5 +105,6 @@ scripts/context audit --root <vault>
 - 返回码 `2` 表示可操作错误；读取标准错误中的 JSON `error`。
 - 初始化或 Provider 安装失败后重新运行 `bootstrap-status`；流程可恢复，不删除已创建的空 Vault。
 - 阶段产物校验失败时只重算损坏的阶段或分块；不要删除整个缓存或改写数据库。需要人工排障时先运行 `transcription-cache-status`。
+- `capture-audio` 失败时不要把私有 job JSON 复制到 inbox。若提示 Markdown 已被人工修改，保留原文件并停止覆盖。
 - 导入失败后运行 `audit`，不要删除 Source 来清理历史。
 - 迁移失败时保留 `backups/` 中的备份并停止写入。

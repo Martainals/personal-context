@@ -452,11 +452,14 @@ def record_consent(
     }
 
 
-def _run_checked(command: list[str], *, env: Optional[dict[str, str]] = None) -> None:
+def _run_checked(
+    command: list[str], *, env: Optional[dict[str, str]] = None
+) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(command, capture_output=True, text=True, check=False, env=env)
     if result.returncode != 0:
         details = (result.stderr or result.stdout or "unknown error")[-6000:]
         raise BootstrapError(f"Runtime command failed ({command[0]}): {details.strip()}")
+    return result
 
 
 def install_qwen_mlx_runtime(config_dir: Path) -> dict[str, Any]:
@@ -623,7 +626,16 @@ def transcribe_audio(
     env = os.environ.copy()
     env["HF_HOME"] = str(runtime / "huggingface")
     env["HF_HUB_OFFLINE"] = "1"
-    _run_checked(command, env=env)
+    provider_process = _run_checked(command, env=env)
+    provider_operation: dict[str, Any] = {}
+    if provider_process is not None and provider_process.stdout.strip():
+        try:
+            parsed_operation = json.loads(provider_process.stdout)
+        except json.JSONDecodeError as exc:
+            raise BootstrapError(f"Provider operation metadata is not valid JSON: {exc}") from exc
+        if not isinstance(parsed_operation, dict):
+            raise BootstrapError("Provider operation metadata must be a JSON object.")
+        provider_operation = parsed_operation
     if not output_path.is_file():
         raise BootstrapError("Transcription provider completed without producing the requested output.")
     try:
@@ -648,6 +660,7 @@ def transcribe_audio(
         "sha256": output_hash,
         "bytes": output_path.stat().st_size,
         "segments": len(segments),
+        "cache": provider_operation.get("cache"),
         "text_exposed_to_agent": receipt.get("mode") == "agent-assisted",
     }
 

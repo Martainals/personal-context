@@ -16,7 +16,7 @@ The private installer bootstraps pinned `uv`, lets it install a private Python 3
 
 ## Provider contract
 
-The heavy Provider runs in a subprocess and receives one explicit local audio path. It must atomically write UTF-8 `transcript.v1` JSON and print only non-sensitive operation metadata. The output contains:
+The heavy Provider runs in a subprocess and receives one explicit local audio path. It must atomically write UTF-8 `transcript.v1` JSON and print only non-sensitive operation metadata. `capture-audio` places that JSON in a private transient job; `transcribe-audio --output` lets debugging/integration callers choose a persistent path. The output contains:
 
 - Event metadata;
 - ordered Segment objects with millisecond timestamps and recording-local `S01`–`S04` labels;
@@ -37,8 +37,11 @@ named audio file
 → cached Qwen forced-alignment chunks
 → cached speaker turns derived from raw probabilities
 → cached confidence-aware final assembly
-→ transcript.v1.json
-→ existing import-transcript
+→ private job transcript.v1.json
+→ staged complete Markdown
+→ existing ingest + import-transcript
+→ atomic inbox Markdown publication
+→ private job cleanup
 ```
 
 Completed recordings use the pinned high-accuracy streaming profile: 340 new frames, 40 future-context frames, 40 FIFO frames, a 300-frame cache update period, and 188 speaker-cache frames. At 80 ms per diarization frame this gives 27.2 seconds of new audio plus 3.2 seconds of future context per main step. The Provider then consolidates probabilities over the whole recording before assigning words.
@@ -47,7 +50,9 @@ When the user knows the number of speakers, pass `--speaker-count 1..4`. The Pro
 
 Post-processing removes sub-100 ms speech fragments, bridges sub-150 ms silence gaps, repairs weak sub-240 ms speaker flips, and only merges a one- or two-character sentence fragment when the surrounding speaker agrees and the switch margin is low. Strong short backchannels remain separate.
 
-The Source must be the original audio. Run `ingest` first and pass its `source_id` to `import-transcript`; otherwise the JSON file itself becomes the Source.
+The Source must be the original audio. The default `capture-audio` path guarantees this association. Low-level callers must run `ingest` first and pass its `source_id` to `import-transcript`; otherwise the JSON file itself becomes the Source.
+
+The stage cache remains the only persisted recovery surface for model work. The transient transcript JSON is deleted after both success and failure, while cached valid stages allow a retry to resume computation. Inbox never stores Provider JSON, diagnostics or test reports; it receives only the completed Markdown delivery.
 
 ## Stage artifact store
 

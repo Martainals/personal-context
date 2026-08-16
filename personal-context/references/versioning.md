@@ -2,7 +2,7 @@
 
 Skill version and database Schema version are independent:
 
-- Skill version: `VERSION` (`0.4.0`)
+- Skill version: `VERSION` (`0.5.0`)
 - Current Schema: `1`
 - Minimum supported Schema: `1`
 - Maximum supported Schema: `1`
@@ -18,6 +18,8 @@ Skill 0.2.0 adds onboarding and replaceable local transcription without modifyin
 Skill 0.3.0 upgrades the pinned `qwen-mlx` profile to version 2. It replaces the arbitrary five-second diarization chunk with NVIDIA's high-context streaming parameter set, adds an optional per-recording speaker-count hint, preserves frame confidence for whole-recording channel selection, and smooths weak speaker flips before word/turn assembly. The transcript contract and Schema remain 1. Because the provider profile digest changes, existing qwen-mlx consent receipts and runtime markers must be renewed through the normal bootstrap plan and apply flow.
 
 Skill 0.4.0 upgrades `qwen-mlx` to profile 3 and adds artifact contract 1: checksummed JSON/gzip cache entries for ASR chunks, alignment chunks, raw diarization probabilities, derived speaker turns and final assembly. Components use independent cache keys and lazy model loading; corrupt or absent entries are recomputed at stage or chunk granularity. The artifacts are private, disposable state outside the Vault and SQLite, so Schema 1 and provider/transcript contract 1 remain unchanged. Consent Notice 2 explicitly discloses the default persistent cache and manual deletion rules; every Notice 1 receipt becomes invalid and must be renewed rather than edited. Artifact contract, profile, notice and Skill versions can change independently in future releases.
+
+Skill 0.5.0 adds the high-level `capture-audio` delivery boundary and generated Markdown integrity contract. `transcript.v1` remains the internal Provider/import format but normally exists only in a private transient job; the Vault inbox receives one complete Markdown per audio stem. This orchestration reuses existing Source and import functions and changes no authoritative database structure, model, cache artifact or consent semantics. Schema 1, provider/transcript contract 1, artifact contract 1, qwen-mlx profile 3 and Consent Notice 2 all remain current; upgrading the source requires neither database migration, consent renewal nor model reinstall.
 
 ## Compatibility behavior
 

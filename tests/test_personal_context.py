@@ -221,6 +221,7 @@ class PersonalContextTests(unittest.TestCase):
         self.assertIn("import-transcript", help_result.stdout)
         self.assertIn("bootstrap-status", help_result.stdout)
         self.assertIn("transcribe-audio", help_result.stdout)
+        self.assertIn("capture-audio", help_result.stdout)
         failure = subprocess.run(
             [str(entry), "doctor", "--root", str(self.root)], capture_output=True, text=True, check=False
         )
@@ -444,7 +445,9 @@ class PersonalContextTests(unittest.TestCase):
 
         commands: list[list[str]] = []
 
-        def fake_run(command: list[str], *, env: Optional[dict[str, str]] = None) -> None:
+        def fake_run(
+            command: list[str], *, env: Optional[dict[str, str]] = None
+        ) -> subprocess.CompletedProcess[str]:
             del env
             commands.append(command)
             output.write_text(
@@ -459,6 +462,14 @@ class PersonalContextTests(unittest.TestCase):
                     ensure_ascii=False,
                 ),
                 encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {"status": "transcribed", "cache": {"enabled": True, "hits": 5, "computed": 0}}
+                ),
+                stderr="",
             )
 
         ready = {"provider": "qwen-mlx", "compatible": True, "installed": True, "ready": True}
@@ -483,6 +494,8 @@ class PersonalContextTests(unittest.TestCase):
         self.assertNotIn("高度敏感的正文", rendered)
         self.assertFalse(result["text_exposed_to_agent"])
         self.assertEqual(result["bytes"], output.stat().st_size)
+        self.assertEqual(result["transcript"], str(output.resolve()))
+        self.assertEqual(result["cache"], {"enabled": True, "hits": 5, "computed": 0})
         self.assertIn("--speaker-count", commands[0])
         self.assertEqual(commands[0][commands[0].index("--speaker-count") + 1], "2")
         self.assertIn("--artifacts-dir", commands[0])
@@ -517,7 +530,7 @@ class PersonalContextTests(unittest.TestCase):
 
     def test_release_versions_keep_schema_and_transcript_contract_stable(self) -> None:
         versions = pc.version_info(None)
-        self.assertEqual(versions["skill_version"], "0.4.0")
+        self.assertEqual(versions["skill_version"], "0.5.0")
         self.assertEqual(versions["schema_version"], 1)
         self.assertEqual(versions["provider_contract_version"], 1)
         self.assertEqual(versions["artifact_contract_version"], 1)
