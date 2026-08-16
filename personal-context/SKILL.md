@@ -46,7 +46,8 @@ scripts/context ingest --root <vault> <audio>
 # 本地转写只返回文件元数据，不在 stdout 打印转录正文
 scripts/context transcribe-audio \
   --root <vault> --agent-host <host> \
-  --audio <audio> --output <transcript.json> --language Chinese
+  --audio <audio> --output <transcript.json> --language Chinese \
+  --speaker-count 2
 
 # 使用上一步 ingest 返回的 source_id，先预览后导入同一个数据库
 scripts/context import-transcript --root <vault> --source-id <source-id> --dry-run <transcript.json>
@@ -54,6 +55,8 @@ scripts/context import-transcript --root <vault> --source-id <source-id> <transc
 ```
 
 在 `strict-local` 模式下，不读取或复述 transcript 文件正文；直接通过命令导入。`agent-assisted` 模式下，只有许可记录中命名的 Agent host 可以读取正文并补充 Entity、Decision、Action 与 CandidateMemory。Provider 只负责转写，不自动制造长期记忆。
+
+`--speaker-count` 只是本次录音的 1–4 人提示；用户确定人数时应传入，不确定时省略。不得把一次录音的标签当成跨录音声纹身份。
 
 ## 常规流程
 

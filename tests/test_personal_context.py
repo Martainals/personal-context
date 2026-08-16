@@ -18,9 +18,11 @@ SKILL_ROOT = REPO_ROOT / "personal-context"
 SCRIPTS = SKILL_ROOT / "scripts"
 FIXTURE = REPO_ROOT / "tests" / "fixtures" / "合成 转录.json"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(SCRIPTS / "providers"))
 
 import personal_context as pc  # noqa: E402
 import personal_context_bootstrap as onboarding  # noqa: E402
+import qwen_mlx  # noqa: E402
 
 
 def file_hash(path: Path) -> str:
@@ -389,8 +391,11 @@ class PersonalContextTests(unittest.TestCase):
                 ),
             )
 
+        commands: list[list[str]] = []
+
         def fake_run(command: list[str], *, env: Optional[dict[str, str]] = None) -> None:
-            del command, env
+            del env
+            commands.append(command)
             output.write_text(
                 json.dumps(
                     {
@@ -419,16 +424,22 @@ class PersonalContextTests(unittest.TestCase):
                 language="Chinese",
                 title=None,
                 observed_at=None,
+                speaker_count=2,
             )
         rendered = json.dumps(result, ensure_ascii=False)
         self.assertNotIn("高度敏感的正文", rendered)
         self.assertFalse(result["text_exposed_to_agent"])
         self.assertEqual(result["bytes"], output.stat().st_size)
+        self.assertIn("--speaker-count", commands[0])
+        self.assertEqual(commands[0][commands[0].index("--speaker-count") + 1], "2")
 
     def test_qwen_provider_profile_is_locked_and_lazy_loads_optional_dependencies(self) -> None:
         manifest = onboarding.load_manifest()
         self.assertEqual(manifest["provider"], "qwen-mlx")
         self.assertEqual(manifest["runtime"]["packages"], ["mlx-audio[stt]==0.4.6"])
+        self.assertEqual(manifest["diarization"]["mode"], "high_accuracy_streaming")
+        self.assertEqual(manifest["diarization"]["streaming"]["chunk_frames"], 340)
+        self.assertEqual(manifest["diarization"]["streaming"]["right_context_frames"], 40)
         for model in manifest["models"].values():
             revision = model["revision"]
             self.assertEqual(len(revision), 40)
@@ -443,6 +454,137 @@ class PersonalContextTests(unittest.TestCase):
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("download", help_result.stdout)
         self.assertIn("transcribe", help_result.stdout)
+
+    def test_known_speaker_count_removes_fragmentary_false_channels(self) -> None:
+        frames = (
+            [[0.86, 0.04, 0.08, 0.02]] * 8
+            + [[0.44, 0.95, 0.12, 0.02]] * 2
+            + [[0.84, 0.05, 0.10, 0.02]] * 8
+            + [[0.08, 0.06, 0.91, 0.02]] * 10
+        )
+        postprocessing = {
+            "activity_threshold": 0.5,
+            "reassignment_threshold": 0.2,
+            "min_speech_seconds": 0.1,
+            "max_silence_gap_seconds": 0.15,
+            "max_weak_switch_seconds": 0.24,
+            "max_weak_switch_margin": 0.18,
+        }
+        segments, selected = qwen_mlx._probabilities_to_diarization(
+            frames,
+            frame_seconds=0.08,
+            expected_speakers=2,
+            postprocessing=postprocessing,
+        )
+        self.assertEqual(selected, [0, 2])
+        self.assertEqual({item["speaker"] for item in segments}, {0, 1})
+        self.assertEqual(segments[0]["speaker"], 0)
+        self.assertEqual(segments[-1]["speaker"], 1)
+
+    def test_second_speaker_can_move_between_model_slots_across_long_audio(self) -> None:
+        frames = (
+            [[0.88, 0.04, 0.03, 0.05]] * 8
+            + [[0.08, 0.04, 0.03, 0.92]] * 8
+            + [[0.89, 0.04, 0.03, 0.04]] * 8
+            + [[0.08, 0.93, 0.03, 0.05]] * 8
+        )
+        postprocessing = {
+            "activity_threshold": 0.5,
+            "reassignment_threshold": 0.2,
+            "min_speech_seconds": 0.1,
+            "max_silence_gap_seconds": 0.15,
+            "max_weak_switch_seconds": 0.24,
+            "max_weak_switch_margin": 0.18,
+        }
+        segments, selected = qwen_mlx._probabilities_to_diarization(
+            frames,
+            frame_seconds=0.1,
+            expected_speakers=2,
+            postprocessing=postprocessing,
+            speaker_selection_window_seconds=1.6,
+        )
+        self.assertEqual(selected, [0, 3, 1])
+        self.assertEqual([item["speaker"] for item in segments], [0, 1, 0, 1])
+
+    def test_low_confidence_sentence_tail_is_not_split_into_another_speaker(self) -> None:
+        words = [
+            {"start": 0.0, "end": 0.6, "text": "不能再熬", "speaker": "S01", "speaker_margin": 0.72},
+            {"start": 0.6, "end": 0.9, "text": "夜了", "speaker": "S02", "speaker_margin": 0.08},
+            {"start": 0.9, "end": 1.1, "text": "我", "speaker": "S01", "speaker_margin": 0.61},
+        ]
+        smoothed = qwen_mlx._smooth_word_speakers(
+            words,
+            {
+                "max_fragment_characters": 2,
+                "max_fragment_seconds": 1.0,
+                "max_fragment_gap_seconds": 0.2,
+                "max_fragment_margin": 0.2,
+            },
+        )
+        self.assertEqual([item["speaker"] for item in smoothed], ["S01", "S01", "S01"])
+
+    def test_confident_short_backchannel_keeps_its_speaker(self) -> None:
+        words = [
+            {"start": 0.0, "end": 0.6, "text": "我们继续", "speaker": "S01", "speaker_margin": 0.72},
+            {"start": 0.6, "end": 0.8, "text": "嗯", "speaker": "S02", "speaker_margin": 0.74},
+            {"start": 0.8, "end": 1.2, "text": "说这个", "speaker": "S01", "speaker_margin": 0.66},
+        ]
+        smoothed = qwen_mlx._smooth_word_speakers(
+            words,
+            {
+                "max_fragment_characters": 2,
+                "max_fragment_seconds": 1.0,
+                "max_fragment_gap_seconds": 0.2,
+                "max_fragment_margin": 0.2,
+            },
+        )
+        self.assertEqual([item["speaker"] for item in smoothed], ["S01", "S02", "S01"])
+
+    def test_speaker_boundary_moves_back_to_the_nearest_word_pause(self) -> None:
+        words = [
+            {"start": 55.44, "end": 55.52, "text": "是", "speaker": "S02", "speaker_margin": 0.79},
+            {"start": 55.60, "end": 55.60, "text": "不", "speaker": "S02", "speaker_margin": 0.79},
+            {"start": 55.68, "end": 55.84, "text": "是", "speaker": "S02", "speaker_margin": 0.79},
+            {"start": 56.16, "end": 56.24, "text": "我", "speaker": "S02", "speaker_margin": 0.79},
+            {"start": 56.24, "end": 56.40, "text": "没", "speaker": "S02", "speaker_margin": 0.79},
+            {"start": 56.40, "end": 56.56, "text": "感", "speaker": "S01", "speaker_margin": 0.92},
+            {"start": 56.56, "end": 56.64, "text": "觉", "speaker": "S01", "speaker_margin": 0.92},
+        ]
+        realigned = qwen_mlx._realign_word_boundaries(
+            words,
+            {
+                "boundary_pause_seconds": 0.2,
+                "boundary_max_shift_seconds": 0.6,
+                "boundary_max_shift_characters": 2,
+                "boundary_join_gap_seconds": 0.08,
+            },
+        )
+        self.assertEqual(
+            [item["speaker"] for item in realigned],
+            ["S02", "S02", "S02", "S01", "S01", "S01", "S01"],
+        )
+
+    def test_speaker_boundary_moves_forward_to_the_nearest_word_pause(self) -> None:
+        words = [
+            {"start": 0.0, "end": 0.6, "text": "不能再熬", "speaker": "S01", "speaker_margin": 0.8},
+            {"start": 0.6, "end": 0.7, "text": "夜", "speaker": "S02", "speaker_margin": 0.7},
+            {"start": 0.7, "end": 0.8, "text": "了", "speaker": "S02", "speaker_margin": 0.7},
+            {"start": 1.1, "end": 1.2, "text": "我", "speaker": "S02", "speaker_margin": 0.7},
+            {"start": 1.2, "end": 1.3, "text": "操", "speaker": "S02", "speaker_margin": 0.7},
+        ]
+        realigned = qwen_mlx._realign_word_boundaries(
+            words,
+            {
+                "boundary_pause_seconds": 0.2,
+                "boundary_max_shift_seconds": 0.6,
+                "boundary_max_shift_characters": 2,
+                "boundary_join_gap_seconds": 0.08,
+            },
+        )
+        self.assertEqual(
+            [item["speaker"] for item in realigned],
+            ["S01", "S01", "S01", "S02", "S02"],
+        )
 
 
 if __name__ == "__main__":

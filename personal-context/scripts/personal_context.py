@@ -1383,6 +1383,12 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--audio", required=True)
     command.add_argument("--output", required=True)
     command.add_argument("--language", help="Optional provider language hint, for example Chinese or English.")
+    command.add_argument(
+        "--speaker-count",
+        type=int,
+        choices=range(1, 5),
+        help="Known number of speakers in this recording; omit to auto-detect up to four.",
+    )
     command.add_argument("--title")
     command.add_argument("--observed-at", help="Optional ISO-8601 event observation time.")
 
@@ -1498,6 +1504,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 language=args.language,
                 title=args.title,
                 observed_at=args.observed_at,
+                speaker_count=args.speaker_count,
             )
         elif args.command == "doctor":
             result = doctor(root)

@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="Skill version 0.2.0" src="https://img.shields.io/badge/skill-0.2.0-0f766e?style=flat-square">
+  <img alt="Skill version 0.3.0" src="https://img.shields.io/badge/skill-0.3.0-0f766e?style=flat-square">
   <img alt="Schema version 1" src="https://img.shields.io/badge/schema-1-b7791f?style=flat-square">
   <img alt="Agent Skills open format" src="https://img.shields.io/badge/format-Agent%20Skills-334155?style=flat-square">
   <img alt="Python 3.9 or newer" src="https://img.shields.io/badge/core-Python%203.9%2B-334155?style=flat-square">
@@ -139,7 +139,8 @@ Agent 应将录音落为一个明确的本地文件路径，再运行：
   --agent-host codex \
   --audio /path/to/recording.m4a \
   --output /private/path/recording.transcript.json \
-  --language Chinese
+  --language Chinese \
+  --speaker-count 2
 
 # 3. 使用 ingest 返回的 source_id 预览并导入同一数据库
 ./personal-context/scripts/context import-transcript \
@@ -155,6 +156,8 @@ Agent 应将录音落为一个明确的本地文件路径，再运行：
 
 `transcribe-audio` 的标准输出只包含文件路径、哈希和大小，不打印转录正文。严格本地模式下，Agent 可以直接完成导入而不读取正文。
 
+`--speaker-count` 是单次录音的可选提示；确定人数时应显式填写 1–4，不确定时省略并自动检测。已录完的文件默认使用高上下文 Sortformer 配置，再依据整段录音的置信度统一说话人通道、清除短暂跳变并组装发言轮次。
+
 > 本地模型不上传音频，但如果用户先把附件上传到云端聊天页面，该宿主可能已经收到文件。敏感录音应尽量以本地路径交给具备本地访问能力的 Agent。
 
 ## 本地模型配置
@@ -165,7 +168,7 @@ Agent 应将录音落为一个明确的本地文件路径，再运行：
 |---|---|---|
 | 转写 | Qwen3-ASR-1.7B-bf16 | 中文与多语言高精度识别 |
 | 对齐 | Qwen3-ForcedAligner-0.6B-bf16 | 字/词级时间戳 |
-| 多人分离 | Streaming Sortformer v2.1 fp32 | 最多四个录音内说话人标签 |
+| 多人分离 | Streaming Sortformer v2.1 fp32 | 高上下文推理、全局人数约束与最多四个录音内标签 |
 
 说话人标签只在单次录音中使用 `S01`–`S04`，不是声纹身份。五人以上、强噪声、重叠发言、超长录音或非英语多人会议可能降低分离质量。
 
@@ -213,10 +216,11 @@ Vault 由用户选择，是唯一权威数据层：
 
 | 项目 | 当前值 |
 |---|---|
-| Skill | `0.2.0` |
+| Skill | `0.3.0` |
 | SQLite Schema | `1` |
 | Consent notice | `1` |
 | Provider contract | `1` |
+| qwen-mlx profile | `2` |
 
 本次新增许可与本地转写能力没有改变权威数据库表，因此 Schema 保持 1；模型与包的来源信息进入既有 `processing_runs.parameters_json`。
 

@@ -1,5 +1,5 @@
 {
-  "profile_version": 1,
+  "profile_version": 2,
   "provider": "qwen-mlx",
   "display_name": "Qwen3-ASR BF16 for Apple Silicon",
   "platform": {
@@ -30,10 +30,36 @@
       "license": "NVIDIA Open Model License"
     }
   },
+  "diarization": {
+    "mode": "high_accuracy_streaming",
+    "frame_seconds": 0.08,
+    "streaming": {
+      "chunk_frames": 340,
+      "right_context_frames": 40,
+      "fifo_frames": 40,
+      "speaker_cache_update_frames": 300,
+      "speaker_cache_frames": 188
+    },
+    "postprocessing": {
+      "activity_threshold": 0.5,
+      "reassignment_threshold": 0.2,
+      "min_speech_seconds": 0.1,
+      "max_silence_gap_seconds": 0.15,
+      "max_weak_switch_seconds": 0.24,
+      "max_weak_switch_margin": 0.18
+    },
+    "word_assembly": {
+      "max_fragment_characters": 2,
+      "max_fragment_seconds": 1.0,
+      "max_fragment_gap_seconds": 0.2,
+      "max_fragment_margin": 0.2,
+      "max_same_speaker_gap_seconds": 1.2,
+      "max_segment_characters": 280
+    }
+  },
   "limits": {
     "maximum_speakers": 4,
     "asr_chunk_seconds": 240,
-    "diarization_chunk_seconds": 5,
     "download_estimate_gb": 6.5,
     "minimum_free_disk_gb": 10
   }

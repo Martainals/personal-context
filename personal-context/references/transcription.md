@@ -30,13 +30,20 @@ The heavy Provider runs in a subprocess and receives one explicit local audio pa
 ```text
 named audio file
 → decode, mono, 16 kHz normalization
-→ 5-second streaming Sortformer diarization
+→ high-context streaming Sortformer inference
+→ whole-recording speaker-count constraint and probability smoothing
 → ASR chunks of at most 240 seconds
 → Qwen forced alignment
-→ timestamp/speaker merge
+→ confidence-aware word/turn assembly
 → transcript.v1.json
 → existing import-transcript
 ```
+
+Completed recordings use the pinned high-accuracy streaming profile: 340 new frames, 40 future-context frames, 40 FIFO frames, a 300-frame cache update period, and 188 speaker-cache frames. At 80 ms per diarization frame this gives 27.2 seconds of new audio plus 3.2 seconds of future context per main step. The Provider then consolidates probabilities over the whole recording before assigning words.
+
+When the user knows the number of speakers, pass `--speaker-count 1..4`. The Provider selects that many stable model slots over the whole recording, remaps them to contiguous `S01` labels, and treats brief activity in rejected slots as uncertain evidence rather than a new person. Without the hint, all four model slots remain available.
+
+Post-processing removes sub-100 ms speech fragments, bridges sub-150 ms silence gaps, repairs weak sub-240 ms speaker flips, and only merges a one- or two-character sentence fragment when the surrounding speaker agrees and the switch margin is low. Strong short backchannels remain separate.
 
 The Source must be the original audio. Run `ingest` first and pass its `source_id` to `import-transcript`; otherwise the JSON file itself becomes the Source.
 

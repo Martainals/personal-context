@@ -361,6 +361,16 @@ def bootstrap_plan(
         "compatible": runtime["compatible"],
         "notice": NOTICE,
         "notice_digest": notice_digest(),
+        "provider_profile": (
+            {
+                "profile_version": manifest["profile_version"],
+                "maximum_speakers": manifest["limits"]["maximum_speakers"],
+                "asr_chunk_seconds": manifest["limits"]["asr_chunk_seconds"],
+                "diarization": manifest["diarization"],
+            }
+            if manifest
+            else None
+        ),
         "plan_digest": consent_scope_digest(
             root, provider=selected, mode=mode, agent_host=agent_host
         ),
@@ -527,6 +537,7 @@ def transcribe_audio(
     language: Optional[str],
     title: Optional[str],
     observed_at: Optional[str],
+    speaker_count: Optional[int] = None,
 ) -> dict[str, Any]:
     receipt = _read_json(_receipt_path(root, config_dir))
     selected = _select_with_receipt(provider, receipt)
@@ -560,6 +571,11 @@ def transcribe_audio(
     ]
     if language:
         command.extend(["--language", language])
+    if speaker_count is not None:
+        maximum_speakers = int(load_manifest()["limits"]["maximum_speakers"])
+        if not 1 <= speaker_count <= maximum_speakers:
+            raise BootstrapError(f"speaker-count must be between 1 and {maximum_speakers}.")
+        command.extend(["--speaker-count", str(speaker_count)])
     if title:
         command.extend(["--title", title])
     if observed_at:
