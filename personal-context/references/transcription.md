@@ -25,16 +25,18 @@ The heavy Provider runs in a subprocess and receives one explicit local audio pa
 
 `import-transcript` stores that provenance inside the existing `processing_runs.parameters_json`; no second database and no Schema change are needed.
 
+Stage artifacts are a separate resumability contract, not part of `transcript.v1` and not imported into SQLite. Skill 0.4.0 uses artifact contract 1 while the transcript/provider contract remains 1.
+
 ## Processing pipeline
 
 ```text
 named audio file
 → decode, mono, 16 kHz normalization
-→ high-context streaming Sortformer inference
-→ whole-recording speaker-count constraint and probability smoothing
-→ ASR chunks of at most 240 seconds
-→ Qwen forced alignment
-→ confidence-aware word/turn assembly
+→ cached high-context streaming Sortformer raw probabilities
+→ cached ASR chunks of at most 240 seconds
+→ cached Qwen forced-alignment chunks
+→ cached speaker turns derived from raw probabilities
+→ cached confidence-aware final assembly
 → transcript.v1.json
 → existing import-transcript
 ```
@@ -47,9 +49,61 @@ Post-processing removes sub-100 ms speech fragments, bridges sub-150 ms silence 
 
 The Source must be the original audio. Run `ingest` first and pass its `source_id` to `import-transcript`; otherwise the JSON file itself becomes the Source.
 
+## Stage artifact store
+
+Persistent artifacts are enabled by default only after the user accepts Consent Notice 2. The default macOS location is:
+
+```text
+~/Library/Application Support/personal-context/artifacts/
+└── <vault-scope-hash>/
+    └── <audio-sha256>/
+        ├── asr/chunk-00000.json.gz
+        ├── alignment/chunk-00000.json.gz
+        ├── diarization/raw-probabilities.json.gz
+        ├── speaker-turns/turns.json.gz
+        └── assembly/segments.json.gz
+```
+
+An explicit `--config-dir` changes only the private base path. The Vault scope is the SHA-256 of the resolved, explicitly supplied `--root`; the audio directory is addressed by the source file SHA-256. Artifacts are canonical UTF-8 JSON inside deterministic gzip envelopes with payload checksums. Directories use mode `0700`, files and per-recording locks use `0600` where the platform supports POSIX permissions. Writes use a same-directory temporary file, `fsync`, and atomic replacement. The format never uses pickle or executable serialization.
+
+One lock serializes work for each recording. A missing, stale, truncated, invalid or checksum-mismatched file is a miss only for that exact stage or chunk; valid sibling chunks remain reusable. Model loading is lazy, so a cache hit does not load that stage's optional MLX model.
+
+The five component keys are independently versioned:
+
+| Artifact | Key inputs | Explicitly excluded |
+|---|---|---|
+| raw diarization | audio SHA, artifact/normalization/stage versions, diarizer revision, pinned runtime package versions, streaming and inference parameters | speaker count, post-processing, title, observed time |
+| ASR chunk | audio SHA, versions, ASR revision, pinned runtime package versions, language and chunk identity | speaker count, diarization rules, title, observed time |
+| alignment chunk | audio SHA, versions, aligner revision, pinned runtime package versions, language, chunk identity and ASR payload hash | speaker count, title, observed time |
+| speaker turns | raw-diarization payload hash, speaker count and post-processing rules | ASR, alignment, title, observed time |
+| final assembly | alignment payload hashes, speaker-turn payload hash and assembly rules | title and observed time |
+
+Therefore changing `title` or `observed_at` only changes the final document metadata. Changing `speaker_count` or post-processing derives new turns from cached raw probabilities without rerunning ASR, alignment or the diarizer. A model, package, language, normalization, chunking or stage-version change invalidates only components whose key names that input.
+
+Operational controls:
+
+```bash
+# Bypass all artifact reads and writes for one transcription.
+scripts/context transcribe-audio ... --no-cache
+
+# Recompute the named model stage; dependent lightweight stages are re-derived as needed.
+scripts/context transcribe-audio ... --refresh-stage asr
+scripts/context transcribe-audio ... --refresh-stage alignment
+scripts/context transcribe-audio ... --refresh-stage diarization
+scripts/context transcribe-audio ... --refresh-stage all
+
+# Read metadata only, or preview/apply explicit deletion. Add --audio to select one recording.
+scripts/context transcription-cache-status --root <vault>
+scripts/context transcription-cache-prune --root <vault> --dry-run
+scripts/context transcription-cache-prune --root <vault> --apply
+```
+
+`--no-cache` and `--refresh-stage` are mutually exclusive. Status does not expose transcript payloads. Prune is never automatic and defaults to dry-run; `--apply` removes only recording directories in the selected Vault scope, or only the named audio hash when `--audio` is present.
+
 ## Limits and quality handling
 
 - Speaker labels identify tracks within one recording only. They are not identities and must not be correlated across recordings.
+- Raw diarization artifacts are frame probabilities for recording-local output slots. They are not voiceprints, speaker embeddings or biometric identities; those representations are forbidden from the artifact store.
 - Sortformer supports at most four speakers and may degrade with five or more speakers, non-English meetings, long recordings, noise, or overlapping speech.
 - ASR accuracy does not establish truth. Every speech Segment becomes a Claim Statement.
 - Do not silently substitute CAM++, pyannote, a cloud API, or another model. A future replacement must be a separately locked Provider and may require renewed consent.

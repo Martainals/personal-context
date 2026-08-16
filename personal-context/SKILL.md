@@ -18,7 +18,7 @@ scripts/context bootstrap-status --root <vault> --agent-host <host>
 若状态不是 `ready`：
 
 1. 运行 `bootstrap-plan --root <vault> --agent-host <host> --mode <strict-local|agent-assisted>`。
-2. 向用户完整说明计划返回的本地写入、下载体积、模型许可、隐私模式和限制。
+2. 向用户完整说明计划返回的本地写入、下载体积、模型许可、隐私模式、持久转写阶段缓存及其手动清理方式和限制。
 3. 仅在用户明确同意后，将绑定 Vault、模式、Provider、模型版本和 Agent host 的 `plan_digest` 传给 `record-consent --accept-plan <digest>`。
 4. 运行 `bootstrap-apply`。该命令只建立已获许可的 Vault 和隔离运行环境；不得改用云端补救失败。
 5. 再运行 `bootstrap-status` 和 `doctor`，必须均正常后才采集真实资料。
@@ -33,6 +33,7 @@ scripts/context bootstrap-status --root <vault> --agent-host <host>
 4. 批量写入先 `--dry-run`。迁移固定按“检查 → 备份 → dry-run → 应用 → 完整性检查 → 审计”执行。
 5. 不上传个人数据，不扫描用户未指定目录，不静默切换 Provider，不把密钥写入数据库或输出。
 6. 将 Wiki 和搜索索引视为可删除、可重建的派生视图。
+7. 将转写阶段产物视为数据库外的敏感可丢弃缓存：不得写入 Skill、Vault 或 Git，不得保存声纹或说话人 embedding，也不得后台自动清理。
 
 ## 录音流程
 
@@ -57,6 +58,16 @@ scripts/context import-transcript --root <vault> --source-id <source-id> <transc
 在 `strict-local` 模式下，不读取或复述 transcript 文件正文；直接通过命令导入。`agent-assisted` 模式下，只有许可记录中命名的 Agent host 可以读取正文并补充 Entity、Decision、Action 与 CandidateMemory。Provider 只负责转写，不自动制造长期记忆。
 
 `--speaker-count` 只是本次录音的 1–4 人提示；用户确定人数时应传入，不确定时省略。不得把一次录音的标签当成跨录音声纹身份。
+
+默认缓存 ASR 分块、逐词对齐分块、原始说话人概率、发言轮次和最终组装。首次启用必须持有 Notice 2 的有效许可。标题和观察时间不影响缓存；人数提示与后处理只重新派生说话人轮次。诊断时可用 `--no-cache` 完全绕过，或用 `--refresh-stage <asr|alignment|diarization|all>` 定向刷新。
+
+```bash
+scripts/context transcription-cache-status --root <vault> [--audio <audio>]
+scripts/context transcription-cache-prune --root <vault> [--audio <audio>] --dry-run
+scripts/context transcription-cache-prune --root <vault> [--audio <audio>] --apply
+```
+
+清理默认是预览；只有用户明确要求删除对应缓存时才使用 `--apply`。完整契约与失效规则见 `references/transcription.md`，敏感性和路径规则见 `references/privacy.md`。
 
 ## 常规流程
 
@@ -99,5 +110,6 @@ scripts/context audit --root <vault>
 
 - 返回码 `2` 表示可操作错误；读取标准错误中的 JSON `error`。
 - 初始化或 Provider 安装失败后重新运行 `bootstrap-status`；流程可恢复，不删除已创建的空 Vault。
+- 阶段产物校验失败时只重算损坏的阶段或分块；不要删除整个缓存或改写数据库。需要人工排障时先运行 `transcription-cache-status`。
 - 导入失败后运行 `audit`，不要删除 Source 来清理历史。
 - 迁移失败时保留 `backups/` 中的备份并停止写入。

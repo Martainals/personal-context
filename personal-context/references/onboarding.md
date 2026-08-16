@@ -24,15 +24,17 @@ Run `bootstrap-plan` and explain its returned facts, not a memorized approximati
 - that local ASR has no cloud fallback;
 - that the surrounding chat application may already have received a user-uploaded attachment;
 - model license and four-speaker diarization limit;
+- that local transcription persists checksummed stage artifacts by default, including text, alignment and raw recording-local diarization probabilities;
+- the exact private artifact path, that it contains no voiceprints or speaker embeddings, and that cleanup is manual with a dry-run preview;
 - that initial consent never approves long-term memory candidates.
 
 Do not run `record-consent` until the user explicitly accepts. Pass the exact current `plan_digest`; it binds the notice, Vault, mode, Provider profile and, for agent-assisted mode, Agent host. A stale, cross-mode, cross-Vault, or invented digest is rejected.
 
 ## Consent scopes
 
-`strict-local` authorizes local audio processing and local database writes. The Agent must not read transcript text; it may use command metadata, IDs, counts, audit results, and review actions.
+`strict-local` authorizes local audio processing, the disclosed private stage artifacts, and local database writes. The Agent must not read transcript text; it may use command metadata, IDs, counts, audit results, and review actions.
 
-`agent-assisted` additionally authorizes the named Agent host to process transcript text under that host's data policy. Changing host requires renewed consent. Changing provider, mode, Vault, or notice version also invalidates the receipt.
+`agent-assisted` additionally authorizes the named Agent host to process transcript text under that host's data policy. Changing host requires renewed consent. Changing provider, mode, Vault, or notice version also invalidates the receipt. Consent Notice 2 introduces default persistent transcription artifacts, so every receipt created under Notice 1 is intentionally invalid and must be renewed from a fresh `bootstrap-plan`; do not migrate or rewrite an old receipt in place.
 
 Receipts live in the operating-system user configuration directory or an explicit `--config-dir`, not in SQLite and not in the reusable Skill. They contain no transcript text or secrets.
 

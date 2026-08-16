@@ -16,8 +16,15 @@ import venv
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from providers.artifacts import (
+    ARTIFACT_CONTRACT_VERSION,
+    inspect_artifacts,
+    prune_artifacts,
+    vault_scope_hash,
+)
 
-NOTICE_VERSION = 1
+
+NOTICE_VERSION = 2
 MODES = {"strict-local", "agent-assisted"}
 PROVIDERS = {"auto", "transcript-only", "qwen-mlx"}
 
@@ -27,17 +34,20 @@ NOTICE = {
         "Create a user-selected SQLite vault and local evidence directories.",
         "Create an isolated private runtime outside the vault when local audio is enabled.",
         "Download pinned runtime packages and model weights only after explicit consent.",
+        "Persist checksummed gzip JSON transcription-stage artifacts outside the vault by default so interrupted or repeated work can resume.",
     ],
     "privacy": [
         "The qwen-mlx provider processes audio locally and never has a cloud fallback.",
         "Strict-local mode keeps transcript text out of the agent context.",
         "Agent-assisted mode permits the named agent host to process transcript text under that host's data policy.",
         "Changing provider, processing mode, vault, this notice version, or an agent-assisted host requires renewed consent.",
+        "Cached text, alignment, and raw diarization probabilities remain sensitive local data until the user explicitly prunes them; they contain no voiceprints or speaker embeddings.",
     ],
     "governance": [
         "Imported speech remains a Claim rather than an established Fact.",
         "Long-term CandidateMemory records still require explicit item-level approval.",
         "The Skill does not scan unspecified directories, run a daemon, create voiceprints, or silently auto-update.",
+        "Transcription cache cleanup is never automatic: status is read-only and pruning previews by default before an explicit apply.",
     ],
 }
 
@@ -87,6 +97,10 @@ def resolve_config_dir(value: Optional[str]) -> Path:
 
 def runtime_dir(config_dir: Path) -> Path:
     return config_dir / "runtime"
+
+
+def artifacts_dir(config_dir: Path) -> Path:
+    return config_dir / "artifacts"
 
 
 def _receipt_path(root: Path, config_dir: Path) -> Path:
@@ -330,6 +344,17 @@ def bootstrap_plan(
     ]
     if database_state.get("status") == "missing":
         steps.append({"action": "init-vault", "writes": str(root.resolve())})
+    if selected == "qwen-mlx":
+        steps.append(
+            {
+                "action": "enable-private-transcription-artifacts",
+                "writes": str(artifacts_dir(config_dir) / vault_scope_hash(root)),
+                "default_enabled": True,
+                "artifact_contract": ARTIFACT_CONTRACT_VERSION,
+                "format": "checksummed gzip JSON",
+                "manual_prune_only": True,
+            }
+        )
     if selected == "qwen-mlx" and not runtime["ready"]:
         steps.append(
             {
@@ -367,6 +392,7 @@ def bootstrap_plan(
                 "maximum_speakers": manifest["limits"]["maximum_speakers"],
                 "asr_chunk_seconds": manifest["limits"]["asr_chunk_seconds"],
                 "diarization": manifest["diarization"],
+                "artifacts": manifest.get("artifacts"),
             }
             if manifest
             else None
@@ -538,6 +564,8 @@ def transcribe_audio(
     title: Optional[str],
     observed_at: Optional[str],
     speaker_count: Optional[int] = None,
+    no_cache: bool = False,
+    refresh_stage: Optional[str] = None,
 ) -> dict[str, Any]:
     receipt = _read_json(_receipt_path(root, config_dir))
     selected = _select_with_receipt(provider, receipt)
@@ -568,6 +596,10 @@ def transcribe_audio(
         str(audio_path),
         "--output",
         str(output_path),
+        "--artifacts-dir",
+        str(artifacts_dir(config_dir)),
+        "--vault-scope",
+        vault_scope_hash(root),
     ]
     if language:
         command.extend(["--language", language])
@@ -580,6 +612,14 @@ def transcribe_audio(
         command.extend(["--title", title])
     if observed_at:
         command.extend(["--observed-at", observed_at])
+    if no_cache:
+        command.append("--no-cache")
+    if refresh_stage is not None:
+        if refresh_stage not in {"asr", "alignment", "diarization", "all"}:
+            raise BootstrapError(f"Unknown refresh stage: {refresh_stage}")
+        if no_cache:
+            raise BootstrapError("--no-cache cannot be combined with --refresh-stage.")
+        command.extend(["--refresh-stage", refresh_stage])
     env = os.environ.copy()
     env["HF_HOME"] = str(runtime / "huggingface")
     env["HF_HUB_OFFLINE"] = "1"
@@ -610,3 +650,39 @@ def transcribe_audio(
         "segments": len(segments),
         "text_exposed_to_agent": receipt.get("mode") == "agent-assisted",
     }
+
+
+def _optional_audio_hash(audio: Optional[Path]) -> Optional[str]:
+    if audio is None:
+        return None
+    path = audio.expanduser().resolve()
+    if not path.is_file():
+        raise BootstrapError(f"Audio file not found: {path}")
+    return digest_file(path)
+
+
+def transcription_cache_status(
+    root: Path, *, config_dir: Path, audio: Optional[Path] = None
+) -> dict[str, Any]:
+    result = inspect_artifacts(
+        artifacts_dir(config_dir),
+        vault_scope_hash(root),
+        audio_sha256=_optional_audio_hash(audio),
+    )
+    return {"status": "ok", "vault_root": str(root.resolve()), **result}
+
+
+def transcription_cache_prune(
+    root: Path,
+    *,
+    config_dir: Path,
+    audio: Optional[Path] = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    result = prune_artifacts(
+        artifacts_dir(config_dir),
+        vault_scope_hash(root),
+        audio_sha256=_optional_audio_hash(audio),
+        apply=apply,
+    )
+    return {"status": "pruned" if apply else "preview", "vault_root": str(root.resolve()), **result}

@@ -19,6 +19,7 @@ venv/
 **/runtime/
 **/models/
 **/cache/
+**/artifacts/
 **/huggingface/
 **/consents/
 .idea/

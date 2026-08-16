@@ -1,5 +1,5 @@
 {
-  "profile_version": 2,
+  "profile_version": 3,
   "provider": "qwen-mlx",
   "display_name": "Qwen3-ASR BF16 for Apple Silicon",
   "platform": {
@@ -30,9 +30,26 @@
       "license": "NVIDIA Open Model License"
     }
   },
+  "artifacts": {
+    "contract_version": 1,
+    "format": "json+gzip",
+    "normalization_version": "mono-16k-v1",
+    "stage_versions": {
+      "asr": 1,
+      "alignment": 1,
+      "diarization": 1,
+      "speaker-turns": 1,
+      "assembly": 1
+    }
+  },
   "diarization": {
     "mode": "high_accuracy_streaming",
     "frame_seconds": 0.08,
+    "inference": {
+      "activity_threshold": 0.5,
+      "min_duration": 0.0,
+      "merge_gap": 0.0
+    },
     "streaming": {
       "chunk_frames": 340,
       "right_context_frames": 40,

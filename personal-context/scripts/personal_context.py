@@ -1323,7 +1323,8 @@ def version_info(root: Optional[Path]) -> dict[str, Any]:
         "min_supported_schema": MIN_SCHEMA_VERSION,
         "max_supported_schema": MAX_SCHEMA_VERSION,
         "provider_contract_version": 1,
-        "consent_notice_version": 1,
+        "artifact_contract_version": 1,
+        "consent_notice_version": 2,
     }
     if root is not None:
         result["database"] = schema_state(root)
@@ -1391,6 +1392,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     command.add_argument("--title")
     command.add_argument("--observed-at", help="Optional ISO-8601 event observation time.")
+    command.add_argument("--no-cache", action="store_true", help="Bypass transcription cache reads and writes for this run.")
+    command.add_argument(
+        "--refresh-stage",
+        choices=("asr", "alignment", "diarization", "all"),
+        help="Recompute one cached transcription stage while retaining other valid artifacts.",
+    )
+
+    command = subparsers.add_parser(
+        "transcription-cache-status",
+        help="Inspect private transcription artifact metadata without exposing transcript text.",
+    )
+    _add_root(command)
+    _add_bootstrap_options(command, include_provider=False)
+    command.add_argument("--audio", help="Limit status to the cache entry for one named audio file.")
+
+    command = subparsers.add_parser(
+        "transcription-cache-prune",
+        help="Preview or apply explicit removal of private transcription artifacts.",
+    )
+    _add_root(command)
+    _add_bootstrap_options(command, include_provider=False)
+    command.add_argument("--audio", help="Limit pruning to the cache entry for one named audio file.")
+    prune_mode = command.add_mutually_exclusive_group()
+    prune_mode.add_argument("--dry-run", action="store_true", help="Preview only; this is the default.")
+    prune_mode.add_argument("--apply", action="store_true", help="Remove the selected cache entries after previewing.")
 
     command = subparsers.add_parser("doctor", help="Check directories, database integrity, schema, and compatibility.")
     _add_root(command)
@@ -1505,6 +1531,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 title=args.title,
                 observed_at=args.observed_at,
                 speaker_count=args.speaker_count,
+                no_cache=args.no_cache,
+                refresh_stage=args.refresh_stage,
+            )
+        elif args.command == "transcription-cache-status":
+            result = onboarding.transcription_cache_status(
+                root,
+                config_dir=onboarding.resolve_config_dir(args.config_dir),
+                audio=Path(args.audio) if args.audio else None,
+            )
+        elif args.command == "transcription-cache-prune":
+            result = onboarding.transcription_cache_prune(
+                root,
+                config_dir=onboarding.resolve_config_dir(args.config_dir),
+                audio=Path(args.audio) if args.audio else None,
+                apply=args.apply,
             )
         elif args.command == "doctor":
             result = doctor(root)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -12,7 +13,38 @@ import os
 import tempfile
 import wave
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
+
+try:
+    from .artifacts import ARTIFACT_CONTRACT_VERSION, ArtifactStore, component_cache_key
+    from .transcript_assembly import (
+        assemble_transcript_segments,
+        joins_without_space,
+        merge_words,
+        realign_word_boundaries,
+        smooth_word_speakers,
+        speaker_details,
+        speaker_for,
+    )
+except ImportError:  # Direct execution from the providers directory.
+    from artifacts import ARTIFACT_CONTRACT_VERSION, ArtifactStore, component_cache_key
+    from transcript_assembly import (
+        assemble_transcript_segments,
+        joins_without_space,
+        merge_words,
+        realign_word_boundaries,
+        smooth_word_speakers,
+        speaker_details,
+        speaker_for,
+    )
+
+
+NORMALIZATION_VERSION = "mono-16k-v1"
+ASR_STAGE_VERSION = 1
+ALIGNMENT_STAGE_VERSION = 1
+DIARIZATION_STAGE_VERSION = 1
+SPEAKER_TURNS_STAGE_VERSION = 1
+ASSEMBLY_STAGE_VERSION = 1
 
 
 def utc_now() -> str:
@@ -330,14 +362,20 @@ def _probabilities_to_diarization(
     return segments, selected_model_slots
 
 
-def _collect_diarization(
+def _collect_raw_diarization(
     model: Any,
     audio_path: Path,
     profile: dict[str, Any],
-    expected_speakers: Optional[int],
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+) -> dict[str, Any]:
     streaming = profile["streaming"]
-    postprocessing = profile["postprocessing"]
+    inference = profile.get(
+        "inference",
+        {
+            "activity_threshold": 0.5,
+            "min_duration": 0.0,
+            "merge_gap": 0.0,
+        },
+    )
     _apply_streaming_profile(model, streaming)
     fallback_frame_seconds = float(profile["frame_seconds"])
     frame_seconds = _model_frame_seconds(model, fallback_frame_seconds)
@@ -346,9 +384,9 @@ def _collect_diarization(
     for result in model.generate_stream(
         str(audio_path),
         chunk_duration=chunk_seconds,
-        threshold=float(postprocessing["activity_threshold"]),
-        min_duration=0.0,
-        merge_gap=0.0,
+        threshold=float(inference["activity_threshold"]),
+        min_duration=float(inference["min_duration"]),
+        merge_gap=float(inference["merge_gap"]),
         spkcache_max=int(streaming["speaker_cache_frames"]),
         fifo_max=int(streaming["fifo_frames"]),
         verbose=False,
@@ -356,6 +394,22 @@ def _collect_diarization(
         probabilities.extend(_probability_rows(getattr(result, "speaker_probs", None)))
     if not probabilities:
         raise RuntimeError("Diarizer returned no speaker probabilities")
+    return {
+        "probabilities": probabilities,
+        "frame_seconds": frame_seconds,
+        "chunk_seconds": chunk_seconds,
+    }
+
+
+def _derive_speaker_turns(
+    raw: dict[str, Any],
+    profile: dict[str, Any],
+    expected_speakers: Optional[int],
+) -> dict[str, Any]:
+    probabilities = raw["probabilities"]
+    frame_seconds = float(raw["frame_seconds"])
+    chunk_seconds = float(raw["chunk_seconds"])
+    postprocessing = profile["postprocessing"]
     segments, selected = _probabilities_to_diarization(
         probabilities,
         frame_seconds=frame_seconds,
@@ -363,274 +417,114 @@ def _collect_diarization(
         postprocessing=postprocessing,
         speaker_selection_window_seconds=chunk_seconds,
     )
-    return segments, {
-        "mode": profile["mode"],
-        "frame_seconds": frame_seconds,
-        "chunk_seconds": chunk_seconds,
-        "expected_speakers": expected_speakers,
-        "selected_model_slots": selected,
-        "output_speakers": expected_speakers if expected_speakers is not None else len(selected),
-        "postprocessing": postprocessing,
-        "streaming": streaming,
+    return {
+        "segments": segments,
+        "details": {
+            "mode": profile["mode"],
+            "frame_seconds": frame_seconds,
+            "chunk_seconds": chunk_seconds,
+            "expected_speakers": expected_speakers,
+            "selected_model_slots": selected,
+            "output_speakers": expected_speakers if expected_speakers is not None else len(selected),
+            "postprocessing": postprocessing,
+            "streaming": profile["streaming"],
+        },
     }
 
 
-def _speaker_details(
-    start: float, end: float, diarization: list[dict[str, Any]]
-) -> tuple[str, float, float]:
-    midpoint = (start + end) / 2.0
-    candidates: list[tuple[float, bool, float, int]] = []
-    for index, item in enumerate(diarization):
-        overlap = max(0.0, min(end, item["end"]) - max(start, item["start"]))
-        contains = item["start"] <= midpoint <= item["end"]
-        if overlap > 0 or contains:
-            candidates.append((overlap, contains, -item["start"], index))
-    if candidates:
-        selected = diarization[max(candidates)[3]]
-    elif diarization:
-        selected = min(
-            diarization,
-            key=lambda item: min(abs(midpoint - item["start"]), abs(midpoint - item["end"])),
+def _collect_diarization(
+    model: Any,
+    audio_path: Path,
+    profile: dict[str, Any],
+    expected_speakers: Optional[int],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Compatibility wrapper for the pre-cache provider interface."""
+    derived = _derive_speaker_turns(
+        _collect_raw_diarization(model, audio_path, profile), profile, expected_speakers
+    )
+    return derived["segments"], derived["details"]
+
+
+# Preserve the provider's historical private names while keeping all word/turn
+# assembly behavior in the dependency-free transcript_assembly module.
+_speaker_details = speaker_details
+_speaker_for = speaker_for
+_smooth_word_speakers = smooth_word_speakers
+_realign_word_boundaries = realign_word_boundaries
+_merge_words = merge_words
+_joins_without_space = joins_without_space
+
+
+def _load_stt_model(models_dir: Path, model: dict[str, Any]) -> Any:
+    from mlx_audio.stt import load as load_stt
+
+    return load_stt(str(model_path(models_dir, model["repo_id"])))
+
+
+def _load_vad_model(models_dir: Path, model: dict[str, Any]) -> Any:
+    from mlx_audio.vad import load as load_vad
+
+    return load_vad(str(model_path(models_dir, model["repo_id"])))
+
+
+def _artifact_config(manifest: dict[str, Any]) -> dict[str, Any]:
+    configured = manifest.get("artifacts") or {}
+    contract = int(configured.get("contract_version", ARTIFACT_CONTRACT_VERSION))
+    if contract != ARTIFACT_CONTRACT_VERSION:
+        raise RuntimeError(
+            f"Unsupported artifact contract {contract}; expected {ARTIFACT_CONTRACT_VERSION}"
         )
-    else:
-        selected = {"speaker": 0, "confidence": 0.0, "margin": 0.0}
-    speaker = int(selected.get("speaker", 0))
-    return (
-        f"S{speaker + 1:02d}",
-        float(selected.get("confidence", 0.0)),
-        float(selected.get("margin", 0.0)),
-    )
-
-
-def _speaker_for(start: float, end: float, diarization: list[dict[str, Any]]) -> str:
-    return _speaker_details(start, end, diarization)[0]
-
-
-def _smooth_word_speakers(
-    words: list[dict[str, Any]], settings: dict[str, Any]
-) -> list[dict[str, Any]]:
-    smoothed = [dict(item) for item in words]
-    if len(smoothed) < 3:
-        return smoothed
-    max_characters = int(settings["max_fragment_characters"])
-    max_seconds = float(settings["max_fragment_seconds"])
-    max_gap = float(settings["max_fragment_gap_seconds"])
-    max_margin = float(settings["max_fragment_margin"])
-    punctuation = set(" \\t\\r\\n,.。，！？!?;；:：、")
-    sentence_end = set("。！？!?;；")
-    backchannels = {"嗯", "啊", "哦", "对", "是", "好", "行", "对的", "没错"}
-
-    groups: list[tuple[int, int]] = []
-    start = 0
-    for index in range(1, len(smoothed) + 1):
-        if index == len(smoothed) or smoothed[index]["speaker"] != smoothed[start]["speaker"]:
-            groups.append((start, index))
-            start = index
-    for group_index in range(1, len(groups) - 1):
-        start, end = groups[group_index]
-        before_start, before_end = groups[group_index - 1]
-        after_start, _ = groups[group_index + 1]
-        before_speaker = smoothed[before_start]["speaker"]
-        if before_speaker != smoothed[after_start]["speaker"] or before_speaker == smoothed[start]["speaker"]:
-            continue
-        text = "".join(str(item.get("text", "")) for item in smoothed[start:end])
-        compact = "".join(character for character in text if character not in punctuation)
-        duration = float(smoothed[end - 1]["end"]) - float(smoothed[start]["start"])
-        gap_before = float(smoothed[start]["start"]) - float(smoothed[before_end - 1]["end"])
-        gap_after = float(smoothed[after_start]["start"]) - float(smoothed[end - 1]["end"])
-        mean_margin = sum(float(item.get("speaker_margin", 1.0)) for item in smoothed[start:end]) / (end - start)
-        left_text = str(smoothed[before_end - 1].get("text", "")).rstrip()
-        if (
-            compact
-            and compact not in backchannels
-            and len(compact) <= max_characters
-            and duration <= max_seconds
-            and gap_before <= max_gap
-            and gap_after <= max_gap
-            and mean_margin <= max_margin
-            and (not left_text or left_text[-1] not in sentence_end)
-        ):
-            for item in smoothed[start:end]:
-                item["speaker"] = before_speaker
-    return smoothed
-
-
-def _realign_word_boundaries(
-    words: list[dict[str, Any]], settings: dict[str, Any]
-) -> list[dict[str, Any]]:
-    """Move a late speaker boundary back to a nearby, explicit word pause.
-
-    The diarizer operates on acoustic frames, so its boundary can trail the
-    conversational turn by one or two aligned characters.  Only move a
-    boundary when the current split cuts a continuous phrase and the proposed
-    split follows a clear pause.  Keeping the correction deliberately small
-    avoids erasing genuine short interjections.
-    """
-    realigned = [dict(item) for item in words]
-    if len(realigned) < 2:
-        return realigned
-
-    pause_seconds = float(
-        settings.get("boundary_pause_seconds", settings.get("max_fragment_gap_seconds", 0.2))
-    )
-    max_shift_seconds = float(
-        settings.get("boundary_max_shift_seconds", settings.get("max_fragment_seconds", 1.0))
-    )
-    max_shift_characters = int(
-        settings.get("boundary_max_shift_characters", settings.get("max_fragment_characters", 2))
-    )
-    join_gap_seconds = float(settings.get("boundary_join_gap_seconds", 0.08))
-    punctuation = set(" \t\r\n,.。，！？!?;；:：、")
-    sentence_end = set("。！？!?;；")
-    backchannels = {"嗯", "啊", "哦", "对", "是", "好", "行", "对的", "没错"}
-
-    boundaries = [
-        index
-        for index in range(1, len(realigned))
-        if realigned[index]["speaker"] != realigned[index - 1]["speaker"]
-    ]
-    for boundary in boundaries:
-        old_speaker = realigned[boundary - 1]["speaker"]
-        new_speaker = realigned[boundary]["speaker"]
-        boundary_gap = float(realigned[boundary]["start"]) - float(realigned[boundary - 1]["end"])
-        if boundary_gap > join_gap_seconds:
-            continue
-
-        candidate_start: Optional[int] = None
-        compact_characters = 0
-        for start in range(boundary - 1, 0, -1):
-            if realigned[start]["speaker"] != old_speaker:
-                break
-            if start < boundary - 1:
-                internal_gap = float(realigned[start + 1]["start"]) - float(realigned[start]["end"])
-                if internal_gap > join_gap_seconds:
-                    break
-            token = "".join(
-                character
-                for character in str(realigned[start].get("text", ""))
-                if character not in punctuation
-            )
-            compact_characters += len(token)
-            duration = float(realigned[boundary - 1]["end"]) - float(realigned[start]["start"])
-            if compact_characters > max_shift_characters or duration > max_shift_seconds:
-                break
-            pause_before = float(realigned[start]["start"]) - float(realigned[start - 1]["end"])
-            if pause_before >= pause_seconds:
-                candidate_start = start
-                break
-
-        if candidate_start is None:
-            candidate_end: Optional[int] = None
-            compact_characters = 0
-            for end in range(boundary, len(realigned) - 1):
-                if realigned[end]["speaker"] != new_speaker:
-                    break
-                if end > boundary:
-                    internal_gap = float(realigned[end]["start"]) - float(
-                        realigned[end - 1]["end"]
-                    )
-                    if internal_gap > join_gap_seconds:
-                        break
-                token = "".join(
-                    character
-                    for character in str(realigned[end].get("text", ""))
-                    if character not in punctuation
+    return {
+        "contract_version": contract,
+        "normalization_version": configured.get("normalization_version", NORMALIZATION_VERSION),
+        "stage_versions": {
+            "asr": int((configured.get("stage_versions") or {}).get("asr", ASR_STAGE_VERSION)),
+            "alignment": int(
+                (configured.get("stage_versions") or {}).get("alignment", ALIGNMENT_STAGE_VERSION)
+            ),
+            "diarization": int(
+                (configured.get("stage_versions") or {}).get(
+                    "diarization", DIARIZATION_STAGE_VERSION
                 )
-                compact_characters += len(token)
-                duration = float(realigned[end]["end"]) - float(
-                    realigned[boundary]["start"]
+            ),
+            "speaker-turns": int(
+                (configured.get("stage_versions") or {}).get(
+                    "speaker-turns", SPEAKER_TURNS_STAGE_VERSION
                 )
-                if compact_characters > max_shift_characters or duration > max_shift_seconds:
-                    break
-                pause_after = float(realigned[end + 1]["start"]) - float(
-                    realigned[end]["end"]
-                )
-                if pause_after >= pause_seconds:
-                    candidate_end = end + 1
-                    break
-            if candidate_end is None:
-                continue
-            candidate_text = "".join(
-                str(item.get("text", "")) for item in realigned[boundary:candidate_end]
-            )
-            compact = "".join(
-                character for character in candidate_text if character not in punctuation
-            )
-            previous_text = str(realigned[boundary - 1].get("text", "")).rstrip()
-            if (
-                not compact
-                or compact in backchannels
-                or (previous_text and previous_text[-1] in sentence_end)
-            ):
-                continue
-            for item in realigned[boundary:candidate_end]:
-                item["speaker"] = old_speaker
-            continue
-
-        candidate_text = "".join(
-            str(item.get("text", "")) for item in realigned[candidate_start:boundary]
-        )
-        compact = "".join(character for character in candidate_text if character not in punctuation)
-        previous_text = str(realigned[candidate_start - 1].get("text", "")).rstrip()
-        if (
-            not compact
-            or compact in backchannels
-            or (previous_text and previous_text[-1] in sentence_end)
-        ):
-            continue
-        for item in realigned[candidate_start:boundary]:
-            item["speaker"] = new_speaker
-    return realigned
+            ),
+            "assembly": int(
+                (configured.get("stage_versions") or {}).get("assembly", ASSEMBLY_STAGE_VERSION)
+            ),
+        },
+    }
 
 
-def _merge_words(
-    words: list[dict[str, Any]],
-    diarization: list[dict[str, Any]],
-    settings: dict[str, Any],
-) -> list[dict[str, Any]]:
-    labeled: list[dict[str, Any]] = []
-    for word in words:
-        speaker, confidence, margin = _speaker_details(word["start"], word["end"], diarization)
-        labeled.append(
-            {
-                **word,
-                "speaker": speaker,
-                "speaker_confidence": confidence,
-                "speaker_margin": margin,
-            }
-        )
-    labeled = _realign_word_boundaries(labeled, settings)
-    labeled = _smooth_word_speakers(labeled, settings)
-    merged: list[dict[str, Any]] = []
-    for word in labeled:
-        speaker = word["speaker"]
-        if (
-            merged
-            and merged[-1]["speaker"] == speaker
-            and word["start"] - merged[-1]["end"] <= float(settings["max_same_speaker_gap_seconds"])
-            and len(merged[-1]["text"]) < int(settings["max_segment_characters"])
-        ):
-            separator = "" if _joins_without_space(merged[-1]["text"], word["text"]) else " "
-            merged[-1]["text"] += separator + word["text"]
-            merged[-1]["end"] = max(merged[-1]["end"], word["end"])
-        else:
-            merged.append({"start": word["start"], "end": word["end"], "speaker": speaker, "text": word["text"]})
-    return [
-        {
-            "start_ms": max(0, round(item["start"] * 1000)),
-            "end_ms": max(0, round(item["end"] * 1000)),
-            "speaker": item["speaker"],
-            "text": item["text"].strip(),
-        }
-        for item in merged
-        if item["text"].strip()
-    ]
+def _model_identity(model: dict[str, Any]) -> dict[str, str]:
+    return {"repo_id": str(model["repo_id"]), "revision": str(model["revision"])}
 
 
-def _joins_without_space(left: str, right: str) -> bool:
-    if not left or not right:
-        return True
-    return ord(left[-1]) > 127 or ord(right[0]) > 127 or right[0] in ",.!?;:，。！？；：、"
+def _cached_payload(
+    store: Optional[ArtifactStore],
+    *,
+    stage: str,
+    name: str,
+    cache_key: str,
+    refresh: bool,
+    compute: Callable[[], Any],
+    cache_events: list[dict[str, str]],
+) -> tuple[Any, str]:
+    if store is not None and not refresh:
+        found = store.read(stage, name, cache_key)
+        cache_events.append({"stage": stage, "name": name, "status": found.status})
+        if found.status == "hit":
+            return found.payload, str(found.payload_sha256)
+    payload = compute()
+    if store is None:
+        cache_events.append({"stage": stage, "name": name, "status": "disabled"})
+        return payload, component_cache_key(payload)
+    written = store.write(stage, name, cache_key, payload)
+    cache_events.append({"stage": stage, "name": name, "status": "refreshed" if refresh else "miss"})
+    return payload, str(written.payload_sha256)
 
 
 def transcribe(
@@ -643,71 +537,252 @@ def transcribe(
     title: Optional[str],
     observed_at: Optional[str],
     speaker_count: Optional[int] = None,
+    artifacts_dir: Optional[Path] = None,
+    vault_scope: Optional[str] = None,
+    no_cache: bool = False,
+    refresh_stage: Optional[str] = None,
 ) -> dict[str, Any]:
-    from mlx_audio.stt import load as load_stt
-    from mlx_audio.vad import load as load_vad
-
+    if refresh_stage not in {None, "asr", "alignment", "diarization", "all"}:
+        raise RuntimeError(f"Unknown refresh stage: {refresh_stage}")
+    if no_cache and refresh_stage is not None:
+        raise RuntimeError("--no-cache cannot be combined with --refresh-stage")
+    if not no_cache and (artifacts_dir is None or vault_scope is None):
+        raise RuntimeError("Cached transcription requires artifacts_dir and vault_scope")
     samples, sample_rate = _to_mono_16k(audio_path)
     if len(samples) == 0:
         raise RuntimeError("Audio contains no samples")
+    source_hash = digest_file(audio_path)
     models = manifest["models"]
-    asr = load_stt(str(model_path(models_dir, models["asr"]["repo_id"])))
-    aligner = load_stt(str(model_path(models_dir, models["aligner"]["repo_id"])))
-    diarizer = load_vad(str(model_path(models_dir, models["diarizer"]["repo_id"])))
     maximum_speakers = int(manifest["limits"]["maximum_speakers"])
     if speaker_count is not None and not 1 <= speaker_count <= maximum_speakers:
         raise RuntimeError(f"speaker_count must be between 1 and {maximum_speakers}")
+    artifact_config = _artifact_config(manifest)
+    common_key = {
+        "artifact_contract": artifact_config["contract_version"],
+        "normalization_version": artifact_config["normalization_version"],
+        "source_audio_sha256": source_hash,
+    }
     chunk_seconds = int(manifest["limits"]["asr_chunk_seconds"])
     chunk_samples = chunk_seconds * sample_rate
     words: list[dict[str, Any]] = []
     fallbacks: list[dict[str, Any]] = []
+    cache_events: list[dict[str, str]] = []
+    store = (
+        None
+        if no_cache
+        else ArtifactStore(Path(artifacts_dir), str(vault_scope), source_hash)
+    )
+    lock = store.recording_lock() if store is not None else contextlib.nullcontext()
+    asr_model: Optional[Any] = None
+    alignment_model: Optional[Any] = None
+    diarization_model: Optional[Any] = None
+
+    def ensure_asr_model() -> Any:
+        nonlocal asr_model
+        if asr_model is None:
+            asr_model = _load_stt_model(models_dir, models["asr"])
+        return asr_model
+
+    def ensure_alignment_model() -> Any:
+        nonlocal alignment_model
+        if alignment_model is None:
+            alignment_model = _load_stt_model(models_dir, models["aligner"])
+        return alignment_model
+
+    def ensure_diarization_model() -> Any:
+        nonlocal diarization_model
+        if diarization_model is None:
+            diarization_model = _load_vad_model(models_dir, models["diarizer"])
+        return diarization_model
+
     with tempfile.TemporaryDirectory(prefix="personal-context-audio-") as temporary:
         temporary_dir = Path(temporary)
         normalized_path = temporary_dir / "normalized.wav"
         _write_wav(normalized_path, samples, sample_rate)
-        diarization, diarization_details = _collect_diarization(
-            diarizer,
-            normalized_path,
-            manifest["diarization"],
-            speaker_count,
-        )
-        for index, start_sample in enumerate(range(0, len(samples), chunk_samples)):
-            chunk = samples[start_sample : start_sample + chunk_samples]
-            chunk_path = temporary_dir / f"chunk-{index:05d}.wav"
-            _write_wav(chunk_path, chunk, sample_rate)
-            result = asr.generate(str(chunk_path), language=language) if language else asr.generate(str(chunk_path))
-            text = str(getattr(result, "text", result)).strip()
-            if not text:
-                continue
-            aligned = aligner.generate(str(chunk_path), text=text, language=language) if language else aligner.generate(str(chunk_path), text=text)
-            offset = start_sample / sample_rate
-            chunk_words = []
-            for item in _alignment_items(aligned):
-                token = str(getattr(item, "text", "")).strip()
-                if not token:
-                    continue
-                start = offset + float(getattr(item, "start_time", 0.0))
-                end = offset + float(getattr(item, "end_time", getattr(item, "start_time", 0.0)))
-                chunk_words.append({"start": start, "end": max(start, end), "text": token})
-            if chunk_words:
-                words.extend(chunk_words)
-            else:
-                end = offset + len(chunk) / sample_rate
-                fallbacks.append({"start": offset, "end": end, "text": text})
-    segments = _merge_words(words, diarization, manifest["diarization"]["word_assembly"])
-    for item in fallbacks:
-        segments.append(
-            {
-                "start_ms": round(item["start"] * 1000),
-                "end_ms": round(item["end"] * 1000),
-                "speaker": _speaker_for(item["start"], item["end"], diarization),
-                "text": item["text"],
-            }
-        )
-    segments.sort(key=lambda item: (item["start_ms"], item["end_ms"]))
+        with lock:
+            raw_key = component_cache_key(
+                {
+                    **common_key,
+                    "component": "diarization",
+                    "component_version": artifact_config["stage_versions"]["diarization"],
+                    "model": _model_identity(models["diarizer"]),
+                    "runtime_packages": manifest["runtime"]["packages"],
+                    "streaming": manifest["diarization"]["streaming"],
+                    "inference": manifest["diarization"].get("inference", {}),
+                }
+            )
+            raw_diarization, raw_sha = _cached_payload(
+                store,
+                stage="diarization",
+                name="raw-probabilities",
+                cache_key=raw_key,
+                refresh=refresh_stage in {"diarization", "all"},
+                compute=lambda: _collect_raw_diarization(
+                    ensure_diarization_model(), normalized_path, manifest["diarization"]
+                ),
+                cache_events=cache_events,
+            )
+
+            alignment_shas: list[str] = []
+            for index, start_sample in enumerate(range(0, len(samples), chunk_samples)):
+                chunk = samples[start_sample : start_sample + chunk_samples]
+                chunk_name = f"chunk-{index:05d}"
+                chunk_path = temporary_dir / f"{chunk_name}.wav"
+                chunk_written = False
+
+                def ensure_chunk_path() -> Path:
+                    nonlocal chunk_written
+                    if not chunk_written:
+                        _write_wav(chunk_path, chunk, sample_rate)
+                        chunk_written = True
+                    return chunk_path
+
+                chunk_identity = {
+                    "chunk_index": index,
+                    "chunk_seconds": chunk_seconds,
+                    "sample_rate": sample_rate,
+                    "start_sample": start_sample,
+                    "sample_count": len(chunk),
+                }
+                asr_key = component_cache_key(
+                    {
+                        **common_key,
+                        "component": "asr",
+                        "component_version": artifact_config["stage_versions"]["asr"],
+                        "model": _model_identity(models["asr"]),
+                        "runtime_packages": manifest["runtime"]["packages"],
+                        "language": language,
+                        "chunk": chunk_identity,
+                    }
+                )
+
+                def compute_asr() -> dict[str, Any]:
+                    model = ensure_asr_model()
+                    result = (
+                        model.generate(str(ensure_chunk_path()), language=language)
+                        if language
+                        else model.generate(str(ensure_chunk_path()))
+                    )
+                    return {"text": str(getattr(result, "text", result)).strip(), **chunk_identity}
+
+                asr_payload, asr_sha = _cached_payload(
+                    store,
+                    stage="asr",
+                    name=chunk_name,
+                    cache_key=asr_key,
+                    refresh=refresh_stage in {"asr", "all"},
+                    compute=compute_asr,
+                    cache_events=cache_events,
+                )
+                text = str(asr_payload["text"])
+                alignment_key = component_cache_key(
+                    {
+                        **common_key,
+                        "component": "alignment",
+                        "component_version": artifact_config["stage_versions"]["alignment"],
+                        "model": _model_identity(models["aligner"]),
+                        "runtime_packages": manifest["runtime"]["packages"],
+                        "language": language,
+                        "chunk": chunk_identity,
+                        "asr_payload_sha256": asr_sha,
+                    }
+                )
+
+                def compute_alignment() -> dict[str, Any]:
+                    offset = start_sample / sample_rate
+                    if not text:
+                        return {"words": [], "fallback": None, **chunk_identity}
+                    model = ensure_alignment_model()
+                    aligned = (
+                        model.generate(str(ensure_chunk_path()), text=text, language=language)
+                        if language
+                        else model.generate(str(ensure_chunk_path()), text=text)
+                    )
+                    chunk_words = []
+                    for item in _alignment_items(aligned):
+                        token = str(getattr(item, "text", "")).strip()
+                        if not token:
+                            continue
+                        start = offset + float(getattr(item, "start_time", 0.0))
+                        end = offset + float(
+                            getattr(item, "end_time", getattr(item, "start_time", 0.0))
+                        )
+                        chunk_words.append({"start": start, "end": max(start, end), "text": token})
+                    fallback = None
+                    if not chunk_words:
+                        fallback = {
+                            "start": offset,
+                            "end": offset + len(chunk) / sample_rate,
+                            "text": text,
+                        }
+                    return {"words": chunk_words, "fallback": fallback, **chunk_identity}
+
+                alignment_payload, alignment_sha = _cached_payload(
+                    store,
+                    stage="alignment",
+                    name=chunk_name,
+                    cache_key=alignment_key,
+                    refresh=refresh_stage in {"alignment", "all"},
+                    compute=compute_alignment,
+                    cache_events=cache_events,
+                )
+                alignment_shas.append(alignment_sha)
+                words.extend(alignment_payload["words"])
+                if alignment_payload.get("fallback") is not None:
+                    fallbacks.append(alignment_payload["fallback"])
+
+            speaker_turns_key = component_cache_key(
+                {
+                    **common_key,
+                    "component": "speaker-turns",
+                    "component_version": artifact_config["stage_versions"]["speaker-turns"],
+                    "raw_diarization_sha256": raw_sha,
+                    "speaker_count": speaker_count,
+                    "postprocessing": manifest["diarization"]["postprocessing"],
+                }
+            )
+            speaker_turns, speaker_turns_sha = _cached_payload(
+                store,
+                stage="speaker-turns",
+                name="turns",
+                cache_key=speaker_turns_key,
+                refresh=refresh_stage in {"diarization", "all"},
+                compute=lambda: _derive_speaker_turns(
+                    raw_diarization, manifest["diarization"], speaker_count
+                ),
+                cache_events=cache_events,
+            )
+            diarization = speaker_turns["segments"]
+            diarization_details = speaker_turns["details"]
+            assembly_key = component_cache_key(
+                {
+                    **common_key,
+                    "component": "assembly",
+                    "component_version": artifact_config["stage_versions"]["assembly"],
+                    "alignment_payload_sha256": alignment_shas,
+                    "speaker_turns_sha256": speaker_turns_sha,
+                    "word_assembly": manifest["diarization"]["word_assembly"],
+                }
+            )
+            assembly_payload, _ = _cached_payload(
+                store,
+                stage="assembly",
+                name="segments",
+                cache_key=assembly_key,
+                refresh=refresh_stage == "all",
+                compute=lambda: {
+                    "segments": assemble_transcript_segments(
+                        words,
+                        fallbacks,
+                        diarization,
+                        manifest["diarization"]["word_assembly"],
+                    )
+                },
+                cache_events=cache_events,
+            )
+            segments = assembly_payload["segments"]
     if not segments:
         raise RuntimeError("No speech was transcribed")
-    source_hash = digest_file(audio_path)
     document = {
         "event": {
             "title": title or audio_path.stem,
@@ -741,12 +816,26 @@ def transcribe(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
     try:
-        temporary_path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary_path.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         os.replace(temporary_path, output_path)
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
-    return {"status": "transcribed", "segments": len(segments), "output": str(output_path)}
+    hits = sum(1 for item in cache_events if item["status"] == "hit")
+    return {
+        "status": "transcribed",
+        "segments": len(segments),
+        "output": str(output_path),
+        "cache": {
+            "enabled": store is not None,
+            "hits": hits,
+            "computed": len(cache_events) - hits,
+            "events": cache_events,
+        },
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -764,6 +853,12 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--speaker-count", type=int, choices=range(1, 5))
     command.add_argument("--title")
     command.add_argument("--observed-at")
+    command.add_argument("--artifacts-dir")
+    command.add_argument("--vault-scope")
+    command.add_argument("--no-cache", action="store_true")
+    command.add_argument(
+        "--refresh-stage", choices=("asr", "alignment", "diarization", "all")
+    )
     return parser
 
 
@@ -783,6 +878,10 @@ def main() -> int:
                 title=args.title,
                 observed_at=args.observed_at,
                 speaker_count=args.speaker_count,
+                artifacts_dir=Path(args.artifacts_dir).resolve() if args.artifacts_dir else None,
+                vault_scope=args.vault_scope,
+                no_cache=args.no_cache,
+                refresh_stage=args.refresh_stage,
             )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0

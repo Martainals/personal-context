@@ -350,6 +350,57 @@ class PersonalContextTests(unittest.TestCase):
         self.assertEqual(changed["status"], "needs_consent")
         self.assertEqual(changed["consent"]["reason"], "agent_host_changed")
 
+    def test_persistent_artifact_notice_invalidates_old_receipts(self) -> None:
+        self.assertEqual(onboarding.NOTICE_VERSION, 2)
+        qwen_plan = onboarding.bootstrap_plan(
+            self.root,
+            config_dir=self.config_dir,
+            mode="strict-local",
+            provider="qwen-mlx",
+            agent_host="codex",
+            database_state=pc.schema_state(self.root),
+        )
+        artifact_step = next(
+            step
+            for step in qwen_plan["steps"]
+            if step["action"] == "enable-private-transcription-artifacts"
+        )
+        self.assertTrue(qwen_plan["requires_explicit_user_consent"])
+        self.assertTrue(artifact_step["default_enabled"])
+        self.assertEqual(artifact_step["artifact_contract"], 1)
+        self.assertEqual(artifact_step["writes"], str(onboarding.artifacts_dir(self.config_dir) / onboarding.vault_scope_hash(self.root)))
+        self.assertFalse(self.root.exists())
+        self.assertFalse(self.config_dir.exists())
+        plan = onboarding.bootstrap_plan(
+            self.root,
+            config_dir=self.config_dir,
+            mode="strict-local",
+            provider="transcript-only",
+            agent_host="codex",
+            database_state=pc.schema_state(self.root),
+        )
+        consent = onboarding.record_consent(
+            self.root,
+            config_dir=self.config_dir,
+            mode="strict-local",
+            provider="transcript-only",
+            agent_host="codex",
+            accepted_digest=plan["plan_digest"],
+        )
+        receipt_path = Path(consent["receipt"])
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["notice_version"] = 1
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        status = onboarding.bootstrap_status(
+            self.root,
+            config_dir=self.config_dir,
+            provider="auto",
+            agent_host="codex",
+            database_state=pc.schema_state(self.root),
+        )
+        self.assertEqual(status["status"], "uninitialized")
+        self.assertEqual(status["consent"]["reason"], "notice_changed")
+
     def test_provider_provenance_is_preserved_without_schema_change(self) -> None:
         self.init()
         payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
@@ -425,6 +476,8 @@ class PersonalContextTests(unittest.TestCase):
                 title=None,
                 observed_at=None,
                 speaker_count=2,
+                no_cache=False,
+                refresh_stage="alignment",
             )
         rendered = json.dumps(result, ensure_ascii=False)
         self.assertNotIn("高度敏感的正文", rendered)
@@ -432,11 +485,18 @@ class PersonalContextTests(unittest.TestCase):
         self.assertEqual(result["bytes"], output.stat().st_size)
         self.assertIn("--speaker-count", commands[0])
         self.assertEqual(commands[0][commands[0].index("--speaker-count") + 1], "2")
+        self.assertIn("--artifacts-dir", commands[0])
+        self.assertIn("--vault-scope", commands[0])
+        self.assertIn("--refresh-stage", commands[0])
+        self.assertEqual(commands[0][commands[0].index("--refresh-stage") + 1], "alignment")
 
     def test_qwen_provider_profile_is_locked_and_lazy_loads_optional_dependencies(self) -> None:
         manifest = onboarding.load_manifest()
         self.assertEqual(manifest["provider"], "qwen-mlx")
+        self.assertEqual(manifest["profile_version"], 3)
         self.assertEqual(manifest["runtime"]["packages"], ["mlx-audio[stt]==0.4.6"])
+        self.assertEqual(manifest["artifacts"]["contract_version"], 1)
+        self.assertEqual(manifest["artifacts"]["format"], "json+gzip")
         self.assertEqual(manifest["diarization"]["mode"], "high_accuracy_streaming")
         self.assertEqual(manifest["diarization"]["streaming"]["chunk_frames"], 340)
         self.assertEqual(manifest["diarization"]["streaming"]["right_context_frames"], 40)
@@ -454,6 +514,14 @@ class PersonalContextTests(unittest.TestCase):
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("download", help_result.stdout)
         self.assertIn("transcribe", help_result.stdout)
+
+    def test_release_versions_keep_schema_and_transcript_contract_stable(self) -> None:
+        versions = pc.version_info(None)
+        self.assertEqual(versions["skill_version"], "0.4.0")
+        self.assertEqual(versions["schema_version"], 1)
+        self.assertEqual(versions["provider_contract_version"], 1)
+        self.assertEqual(versions["artifact_contract_version"], 1)
+        self.assertEqual(versions["consent_notice_version"], 2)
 
     def test_known_speaker_count_removes_fragmentary_false_channels(self) -> None:
         frames = (
@@ -584,6 +652,43 @@ class PersonalContextTests(unittest.TestCase):
         self.assertEqual(
             [item["speaker"] for item in realigned],
             ["S01", "S01", "S01", "S02", "S02"],
+        )
+
+    def test_transcript_assembly_module_preserves_030_provider_behavior(self) -> None:
+        import transcript_assembly
+
+        diarization = [
+            {"start": 0.0, "end": 0.9, "speaker": 0, "confidence": 0.92, "margin": 0.71},
+            {"start": 0.9, "end": 1.8, "speaker": 1, "confidence": 0.89, "margin": 0.66},
+        ]
+        words = [
+            {"start": 0.0, "end": 0.4, "text": "我们"},
+            {"start": 0.4, "end": 0.8, "text": "开始"},
+            {"start": 1.0, "end": 1.3, "text": "好的"},
+        ]
+        settings = {
+            "max_fragment_characters": 2,
+            "max_fragment_seconds": 1.0,
+            "max_fragment_gap_seconds": 0.2,
+            "max_fragment_margin": 0.2,
+            "max_same_speaker_gap_seconds": 1.2,
+            "max_segment_characters": 280,
+        }
+        extracted = transcript_assembly.merge_words(words, diarization, settings)
+        expected = [
+            {"start_ms": 0, "end_ms": 800, "speaker": "S01", "text": "我们开始"},
+            {"start_ms": 1000, "end_ms": 1300, "speaker": "S02", "text": "好的"},
+        ]
+        self.assertEqual(extracted, expected)
+
+        fallbacks = [{"start": 2.0, "end": 2.6, "text": "补充"}]
+        assembled = transcript_assembly.assemble_transcript_segments(
+            words, fallbacks, diarization, settings
+        )
+        self.assertEqual(assembled[: len(expected)], expected)
+        self.assertEqual(
+            assembled[-1],
+            {"start_ms": 2000, "end_ms": 2600, "speaker": "S02", "text": "补充"},
         )
 
 

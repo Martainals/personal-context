@@ -34,8 +34,10 @@ Optional top-level arrays are `entities`, `statements`, `decisions`, `actions`, 
 
 An optional top-level `processing` object carries upstream Provider and model provenance. Import preserves it in `processing_runs.parameters_json`; applications must not interpret it as user-authored content.
 
+Transcription-stage cache metadata is intentionally absent from this object. Cache hits, misses, raw diarization probabilities and intermediate alignment chunks are local execution details under artifact contract 1; they never become Source, Segment, Claim, Memory or authoritative database rows. Cold and warm runs with the same fixed event metadata must emit the same `transcript.v1` document.
+
 Use `--source-id` when a transcript describes an already-ingested audio or document Source. Without it, the JSON transcript file itself becomes the immutable Source.
 
 ## Provider boundary
 
-Skill 0.2.0 includes a local `qwen-mlx` Provider and a universal `transcript-only` profile. Both emit or accept the same contract above. Read `transcription.md` before operating or changing a Provider. Provider code cannot write authoritative database rows directly.
+Skill 0.2.0 includes a local `qwen-mlx` Provider and a universal `transcript-only` profile. Skill 0.4.0 adds resumable stage artifacts without changing this transcript contract. Both profiles emit or accept the same contract above. Read `transcription.md` before operating or changing a Provider. Provider and artifact code cannot write authoritative database rows directly.
