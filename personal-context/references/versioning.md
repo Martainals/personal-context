@@ -2,7 +2,7 @@
 
 Skill version and database Schema version are independent:
 
-- Skill version: `VERSION` (`0.5.1`)
+- Skill version: `VERSION` (`0.6.0`)
 - Current Schema: `1`
 - Minimum supported Schema: `1`
 - Maximum supported Schema: `1`
@@ -22,6 +22,8 @@ Skill 0.4.0 upgrades `qwen-mlx` to profile 3 and adds artifact contract 1: check
 Skill 0.5.0 adds the high-level `capture-audio` delivery boundary and generated Markdown integrity contract. `transcript.v1` remains the internal Provider/import format but normally exists only in a private transient job; the Vault inbox receives one complete Markdown per audio stem. This orchestration reuses existing Source and import functions and changes no authoritative database structure, model, cache artifact or consent semantics. Schema 1, provider/transcript contract 1, artifact contract 1, qwen-mlx profile 3 and Consent Notice 2 all remain current; upgrading the source requires neither database migration, consent renewal nor model reinstall.
 
 Skill 0.5.1 makes transcription explicitly request-driven, returns an intact matching delivery without rerunning the Provider, and adds human-readable cache/source mapping plus aggregate storage metadata. It retains one immutable Vault audio Source, never deletes the caller's original, performs no cross-filename duplicate scan and never cleans caches automatically. These are orchestration and metadata-view changes only: Schema 1, Provider/transcript contract 1, artifact contract 1, qwen-mlx profile 3 and Consent Notice 2 remain unchanged.
+
+Skill 0.6.0 restores punctuation already produced by ASR after forced alignment, splits final segments at sentence endings or 0.8-second pauses, defaults speaker count to automatic unless the user volunteers a hint, and publishes title-based `YYYY-MM-DD HH：MM：SS-内容标题.md` deliveries. Agent-assisted hosts may prepare the short title from a private transient low-level transcript; strict-local mode never exposes text for title generation. Existing ASR, alignment and diarization artifacts remain reusable because punctuation restoration has its own assembly-key version. Schema 1, Provider/transcript contract 1, artifact contract 1, qwen-mlx profile 3 and Consent Notice 2 remain unchanged, so this release requires no database migration, model reinstall or consent renewal.
 
 ## Compatibility behavior
 

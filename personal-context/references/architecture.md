@@ -31,7 +31,7 @@ The private configuration and runtime use the operating-system user configuratio
 └── backups/            # migration backups
 ```
 
-The database and immutable Source blobs are authoritative. `inbox/*-录音转写.md`, `wiki/`, and `search_index` are derived human-readable views. Normal audio capture never persists `transcript.v1` JSON in the Vault.
+The database and immutable Source blobs are authoritative. Title-based `inbox/*.md`, `wiki/`, and `search_index` are derived human-readable views. Normal audio capture never persists `transcript.v1` JSON in the Vault.
 
 ## Pipeline
 

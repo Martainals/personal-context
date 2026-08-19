@@ -7,7 +7,110 @@ It turns already-derived alignment and diarization evidence into the stable
 
 from __future__ import annotations
 
+import bisect
+import difflib
+import unicodedata
 from typing import Any, Optional
+
+
+PUNCTUATION_RESTORATION_VERSION = 1
+_PUNCTUATION = set("，。！？；：、,.!?;:‘’“”\"'（）()《》【】[]—…")
+_OPENING_PUNCTUATION = set("‘“\"'（(《【[")
+_CLOSING_WRAPPERS = set("’”\"'）)》】]」』")
+_SENTENCE_END = set("。！？!?；;")
+
+
+def restore_asr_punctuation(
+    asr_text: str,
+    words: list[dict[str, Any]],
+    *,
+    minimum_similarity: float = 0.95,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Map untimed ASR punctuation back to aligned characters without changing words."""
+    restored = [dict(item) for item in words]
+    if not restored or not asr_text:
+        return restored, {"status": "empty", "similarity": 0.0, "restored": 0}
+    if any(character in _PUNCTUATION for item in restored for character in str(item["text"])):
+        return restored, {"status": "already_punctuated", "similarity": 1.0, "restored": 0}
+
+    def content(character: str) -> bool:
+        return not character.isspace() and character not in _PUNCTUATION
+
+    def normalized(character: str) -> str:
+        return unicodedata.normalize("NFKC", character).casefold()
+
+    raw_content = [
+        (raw_index, character)
+        for raw_index, character in enumerate(asr_text)
+        if content(character)
+    ]
+    aligned_content: list[tuple[int, int, str]] = []
+    for token_index, item in enumerate(restored):
+        for local_index, character in enumerate(str(item["text"])):
+            if content(character):
+                aligned_content.append((token_index, local_index, character))
+
+    matcher = difflib.SequenceMatcher(
+        None,
+        [normalized(character) for _, character in raw_content],
+        [normalized(character) for _, _, character in aligned_content],
+        autojunk=False,
+    )
+    similarity = matcher.ratio()
+    if similarity < minimum_similarity:
+        return restored, {
+            "status": "low_similarity",
+            "similarity": round(similarity, 6),
+            "restored": 0,
+        }
+
+    raw_to_aligned: dict[int, int] = {}
+    for raw_start, aligned_start, size in matcher.get_matching_blocks():
+        for offset in range(size):
+            raw_to_aligned[raw_start + offset] = aligned_start + offset
+    mapped_raw = sorted(raw_to_aligned)
+    mapped_positions = [raw_content[index][0] for index in mapped_raw]
+    prefix: dict[tuple[int, int], list[str]] = {}
+    suffix: dict[tuple[int, int], list[str]] = {}
+    restored_count = 0
+    for raw_position, character in enumerate(asr_text):
+        if character not in _PUNCTUATION:
+            continue
+        insertion = bisect.bisect_left(mapped_positions, raw_position)
+        previous = mapped_raw[insertion - 1] if insertion else None
+        following = mapped_raw[insertion] if insertion < len(mapped_raw) else None
+        if character in _OPENING_PUNCTUATION and following is not None:
+            token_index, local_index, _ = aligned_content[raw_to_aligned[following]]
+            prefix.setdefault((token_index, local_index), []).append(character)
+            restored_count += 1
+        elif previous is not None:
+            token_index, local_index, _ = aligned_content[raw_to_aligned[previous]]
+            suffix.setdefault((token_index, local_index), []).append(character)
+            restored_count += 1
+        elif following is not None:
+            token_index, local_index, _ = aligned_content[raw_to_aligned[following]]
+            prefix.setdefault((token_index, local_index), []).append(character)
+            restored_count += 1
+
+    for token_index, item in enumerate(restored):
+        rebuilt: list[str] = []
+        for local_index, character in enumerate(str(item["text"])):
+            rebuilt.extend(prefix.get((token_index, local_index), []))
+            rebuilt.append(character)
+            rebuilt.extend(suffix.get((token_index, local_index), []))
+        item["text"] = "".join(rebuilt)
+    return restored, {
+        "status": "restored",
+        "similarity": round(similarity, 6),
+        "restored": restored_count,
+    }
+
+
+def _ends_sentence(value: str) -> bool:
+    compact = value.rstrip()
+    while compact and compact[-1] in _CLOSING_WRAPPERS:
+        compact = compact[:-1].rstrip()
+    return bool(compact and compact[-1] in _SENTENCE_END)
 
 
 def speaker_details(
@@ -228,12 +331,16 @@ def merge_words(
     labeled = realign_word_boundaries(labeled, settings)
     labeled = smooth_word_speakers(labeled, settings)
     merged: list[dict[str, Any]] = []
+    sentence_pause = float(settings.get("sentence_pause_seconds", 0.8))
     for word in labeled:
         speaker = word["speaker"]
+        gap = word["start"] - merged[-1]["end"] if merged else 0.0
         if (
             merged
             and merged[-1]["speaker"] == speaker
-            and word["start"] - merged[-1]["end"] <= float(settings["max_same_speaker_gap_seconds"])
+            and gap <= float(settings["max_same_speaker_gap_seconds"])
+            and gap < sentence_pause
+            and not _ends_sentence(merged[-1]["text"])
             and len(merged[-1]["text"]) < int(settings["max_segment_characters"])
         ):
             separator = "" if joins_without_space(merged[-1]["text"], word["text"]) else " "

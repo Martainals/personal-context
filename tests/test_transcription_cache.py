@@ -291,7 +291,7 @@ class ProviderStageCacheTests(unittest.TestCase):
             def generate(self, path: str, language: Optional[str] = None) -> object:
                 del path, language
                 counters["asr_generate"] += 1
-                return types.SimpleNamespace(text="你好世界")
+                return types.SimpleNamespace(text="你好，世界。")
 
         class AlignerModel:
             def generate(self, path: str, text: str, language: Optional[str] = None) -> object:
@@ -394,6 +394,13 @@ class ProviderStageCacheTests(unittest.TestCase):
             )
             self.assertEqual(counters, cold_counts)
             self.assertEqual(cold.read_bytes(), hot.read_bytes())
+            self.assertEqual(
+                "".join(
+                    item["text"]
+                    for item in json.loads(cold.read_text(encoding="utf-8"))["segments"]
+                ),
+                "你好，世界。",
+            )
 
             qwen_mlx.transcribe(
                 copy.deepcopy(self.manifest),

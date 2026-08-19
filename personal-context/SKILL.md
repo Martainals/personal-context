@@ -42,20 +42,31 @@ scripts/context bootstrap-status --root <vault> --agent-host <host>
 只有用户明确提出“转写”“生成逐字稿”或同义请求时才运行录音流程。附件出现、用户只命名文件、询问方案或讨论录音内容都不构成转写授权；不要预先采集、转写或生成交付文件。
 
 ```bash
-# 用户要求录音转写时使用默认高层交付入口
+# 先只读确认是否已有交付
+scripts/context capture-audio \
+  --root <vault> --agent-host <host> \
+  --audio <audio> --language Chinese --check-only
+
+# 确认需要处理后，带内容标题执行正式交付
 scripts/context capture-audio \
   --root <vault> --agent-host <host> \
   --audio <audio> --language Chinese \
-  --speaker-count 2
+  --title <内容标题>
 ```
 
-`capture-audio` 在私有临时 job 中处理内部 `transcript.v1`，采集原音频 Source、原子导入证据，最后只向 `<vault>/inbox/` 发布 `<audio-stem>-录音转写.md`；正常成功后删除 job JSON。Vault 在 `blobs/` 中保留一份不可变原音频，不处理或删除用户提供位置的原件。最终回复把该 Markdown 路径作为主要交付，不提供内部 JSON。在 `strict-local` 模式下，不读取、复述或打印转录正文。Provider 只负责转写，本流程不生成总结，不形成或批准长期 Memory。
+`--check-only` 不调用 Provider，也不写 Source、Event、缓存或 Inbox；已有交付时直接返回，否则返回 `title_required`。在 `agent-assisted` 模式下需要标题时，先把低层 `transcribe-audio` 的 JSON 写入 Vault 与 Skill 之外的私有临时目录，只读取 `segments[].text`，据完整内容生成一个具体、克制的 8–20 个中文字标题，再调用 `capture-audio --title <标题>`。标题只描述核心话题，不写“录音”“录音转写”“逐字稿”，不把推断冒充事实；无清晰主题时用中性标题。无论成功或失败都删除临时 JSON。第二次调用会复用 ASR、对齐和说话人缓存，不重复重算重模型阶段。
+
+在 `strict-local` 模式下不得为了标题把正文读入 Agent；优先使用用户给出的标题，没有时使用 `未命名主题`。内容标题只是文件与 Event 的短标签，不是总结，不形成或批准长期 Memory。
+
+`capture-audio` 在私有临时 job 中处理内部 `transcript.v1`，采集原音频 Source、原子导入证据，最后只向 `<vault>/inbox/` 发布 `YYYY-MM-DD HH：MM：SS-内容标题.md`；优先使用原录音文件名中的录制时间，不能解析时才使用观察时间。同一时间和标题已被另一份录音占用时追加 `-2`、`-3`。正常成功后删除 job JSON。Vault 在 `blobs/` 中保留一份不可变原音频，不处理或删除用户提供位置的原件。最终回复把该 Markdown 路径作为主要交付，不提供内部 JSON。在 `strict-local` 模式下，不读取、复述或打印转录正文。
 
 同一路径已有完整、未编辑且数据库证据匹配的交付时，默认返回现有 Markdown，不调用 Provider。只有用户明确要求重新转写时才加 `--rerun`；若标题、观察时间或重新生成的不可变 Segment 与既有 Event 不同则停止，避免静默建立第二个事件或覆盖证据。不要主动扫描其他文件名或目录寻找重复录音。
 
 `transcribe-audio --output <transcript.json>` 与手工 `ingest` / `import-transcript` 仅用于调试和第三方集成，不用于普通录音请求。完整发布顺序、失败恢复和人工编辑保护见 `references/capture.md`。
 
-`--speaker-count` 只是本次录音的 1–4 人提示；用户确定人数时应传入，不确定时省略。不得把一次录音的标签当成跨录音声纹身份。
+人数默认由 Provider 自行判断，不要询问用户。只有用户主动明确说出本次录音人数时才传 `--speaker-count 1..4`。不得把一次录音的标签当成跨录音声纹身份。
+
+ASR 原文中的标点会在逐词对齐后按字符相似度安全贴回；相似度不足时宁可保留无标点结果，也不增删或猜测原词。最终组装在句末标点或至少 0.8 秒停顿处断段，避免把长段对话连成一整段。
 
 默认缓存 ASR 分块、逐词对齐分块、原始说话人概率、发言轮次和最终组装。首次启用必须持有 Notice 2 的有效许可。标题和观察时间不影响缓存；人数提示与后处理只重新派生说话人轮次。诊断时可用 `--no-cache` 完全绕过，或用 `--refresh-stage <asr|alignment|diarization|all>` 定向刷新。
 

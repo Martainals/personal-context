@@ -18,10 +18,12 @@ from typing import Any, Callable, Iterable, Optional
 try:
     from .artifacts import ARTIFACT_CONTRACT_VERSION, ArtifactStore, component_cache_key
     from .transcript_assembly import (
+        PUNCTUATION_RESTORATION_VERSION,
         assemble_transcript_segments,
         joins_without_space,
         merge_words,
         realign_word_boundaries,
+        restore_asr_punctuation,
         smooth_word_speakers,
         speaker_details,
         speaker_for,
@@ -29,10 +31,12 @@ try:
 except ImportError:  # Direct execution from the providers directory.
     from artifacts import ARTIFACT_CONTRACT_VERSION, ArtifactStore, component_cache_key
     from transcript_assembly import (
+        PUNCTUATION_RESTORATION_VERSION,
         assemble_transcript_segments,
         joins_without_space,
         merge_words,
         realign_word_boundaries,
+        restore_asr_punctuation,
         smooth_word_speakers,
         speaker_details,
         speaker_for,
@@ -624,6 +628,7 @@ def transcribe(
             )
 
             alignment_shas: list[str] = []
+            punctuation_inputs: list[dict[str, Any]] = []
             for index, start_sample in enumerate(range(0, len(samples), chunk_samples)):
                 chunk = samples[start_sample : start_sample + chunk_samples]
                 chunk_name = f"chunk-{index:05d}"
@@ -727,7 +732,20 @@ def transcribe(
                     cache_events=cache_events,
                 )
                 alignment_shas.append(alignment_sha)
-                words.extend(alignment_payload["words"])
+                punctuated_words, punctuation_details = restore_asr_punctuation(
+                    text, alignment_payload["words"]
+                )
+                words.extend(punctuated_words)
+                punctuation_inputs.append(
+                    {
+                        "version": PUNCTUATION_RESTORATION_VERSION,
+                        "asr_payload_sha256": asr_sha,
+                        "alignment_payload_sha256": alignment_sha,
+                        "status": punctuation_details["status"],
+                        "similarity": punctuation_details["similarity"],
+                        "restored": punctuation_details["restored"],
+                    }
+                )
                 if alignment_payload.get("fallback") is not None:
                     fallbacks.append(alignment_payload["fallback"])
 
@@ -760,6 +778,7 @@ def transcribe(
                     "component": "assembly",
                     "component_version": artifact_config["stage_versions"]["assembly"],
                     "alignment_payload_sha256": alignment_shas,
+                    "punctuation_restoration": punctuation_inputs,
                     "speaker_turns_sha256": speaker_turns_sha,
                     "word_assembly": manifest["diarization"]["word_assembly"],
                 }
@@ -811,6 +830,17 @@ def transcribe(
             "maximum_speakers": maximum_speakers,
             "speaker_count_hint": speaker_count,
             "diarization": diarization_details,
+            "punctuation_restoration": {
+                "version": PUNCTUATION_RESTORATION_VERSION,
+                "chunks": len(punctuation_inputs),
+                "restored": sum(int(item["restored"]) for item in punctuation_inputs),
+                "statuses": {
+                    status: sum(
+                        1 for item in punctuation_inputs if item["status"] == status
+                    )
+                    for status in sorted({item["status"] for item in punctuation_inputs})
+                },
+            },
         },
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)

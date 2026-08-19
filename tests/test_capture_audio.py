@@ -102,7 +102,7 @@ class CaptureAudioTests(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.root = self.base / "隔离 Vault"
         self.config = self.base / "隔离 配置"
-        self.audio = self.base / "用户录音.m4a"
+        self.audio = self.base / "2026-08-16_16_00_00.m4a"
         self.audio.write_bytes(b"synthetic audio bytes only")
         pc.init_vault(self.root)
 
@@ -146,9 +146,12 @@ class CaptureAudioTests(unittest.TestCase):
         self.assertNotIn((self.root / "inbox").resolve(), output.parents)
         if sys.platform != "win32":
             self.assertEqual(output.parent.stat().st_mode & 0o777, 0o700)
-        output.write_text(
-            json.dumps(self._provider_document(), ensure_ascii=False), encoding="utf-8"
+        document = self._provider_document()
+        document["event"]["title"] = kwargs.get("title") or document["event"]["title"]
+        document["event"]["observed_at"] = (
+            kwargs.get("observed_at") or document["event"]["observed_at"]
         )
+        output.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
         return {
             "status": "transcribed",
             "provider": "qwen-mlx",
@@ -196,6 +199,8 @@ class CaptureAudioTests(unittest.TestCase):
                     "Chinese",
                     "--speaker-count",
                     "2",
+                    "--title",
+                    "童年回忆与电子族谱构想",
                 ]
             )
 
@@ -203,7 +208,10 @@ class CaptureAudioTests(unittest.TestCase):
         result = outputs[0]
         stdout = json.dumps(result, ensure_ascii=False)
         inbox_files = sorted(path.name for path in (self.root / "inbox").iterdir())
-        self.assertEqual(inbox_files, ["用户录音-录音转写.md"])
+        self.assertEqual(
+            inbox_files,
+            ["2026-08-16 16：00：00-童年回忆与电子族谱构想.md"],
+        )
         self.assertFalse(any((self.root / "inbox").glob("*.json")))
         self.assertFalse(any(self.config.rglob("*.json")))
         markdown_path = Path(result["markdown"]["path"])
@@ -268,7 +276,7 @@ class CaptureAudioTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0], 0)
         self.assertEqual(
             sorted(path.name for path in (self.root / "inbox").iterdir()),
-            ["用户录音-录音转写.md"],
+            ["2026-08-16 16：00：00-未命名主题.md"],
         )
 
     def test_explicit_rerun_reuses_one_delivery_and_rejects_metadata_drift(self) -> None:
@@ -318,8 +326,113 @@ class CaptureAudioTests(unittest.TestCase):
         self.assertEqual(self._db_count("segments"), 2)
         self.assertEqual(
             sorted(path.name for path in (self.root / "inbox").iterdir()),
-            ["用户录音-录音转写.md"],
+            ["2026-08-16 16：00：00-未命名主题.md"],
         )
+
+    def test_check_only_is_read_only_and_reuses_an_existing_delivery(self) -> None:
+        with mock.patch.object(
+            onboarding, "transcribe_audio", side_effect=self._fake_transcribe
+        ) as provider:
+            needed = pc.capture_audio(
+                self.root,
+                config_dir=self.config,
+                provider="qwen-mlx",
+                agent_host="codex",
+                audio=self.audio,
+                language="Chinese",
+                title=None,
+                observed_at=None,
+                check_only=True,
+            )
+            self.assertEqual(needed["status"], "title_required")
+            self.assertEqual(self._db_count("sources"), 0)
+            self.assertEqual(provider.call_count, 0)
+            captured = pc.capture_audio(
+                self.root,
+                config_dir=self.config,
+                provider="qwen-mlx",
+                agent_host="codex",
+                audio=self.audio,
+                language="Chinese",
+                title="童年回忆与电子族谱构想",
+                observed_at=None,
+            )
+            existing = pc.capture_audio(
+                self.root,
+                config_dir=self.config,
+                provider="qwen-mlx",
+                agent_host="codex",
+                audio=self.audio,
+                language="Chinese",
+                title=None,
+                observed_at=None,
+                check_only=True,
+            )
+
+        self.assertEqual(self._db_count("sources"), 1)
+        self.assertEqual(provider.call_count, 1)
+        self.assertEqual(existing["status"], "already_delivered")
+        self.assertEqual(existing["markdown"]["path"], captured["markdown"]["path"])
+
+    def test_delivery_name_uses_recorder_time_and_cross_platform_colons(self) -> None:
+        name = pc._delivery_filename(
+            Path("2026-08-18_18_59_28.wav"),
+            "童年回忆/电子族谱构想-录音转写",
+            "2026-08-19T05:20:00Z",
+        )
+        self.assertEqual(
+            name,
+            "2026-08-18 18：59：28-童年回忆 电子族谱构想.md",
+        )
+        self.assertNotIn(":", name)
+
+    def test_different_audio_with_same_time_and_title_uses_numbered_name(self) -> None:
+        other_audio = self.base / "副本录音.m4a"
+        other_audio.write_bytes(b"different synthetic audio bytes")
+        base = self.root / "inbox" / "2026-08-16 16：00：00-同名主题.md"
+        first = transcript_markdown.render_transcript_markdown(
+            self._provider_document(), source_audio_sha256=hashlib.sha256(b"first").hexdigest()
+        )
+        transcript_markdown.publish_markdown(base, first)
+
+        selected = pc._available_delivery_path(
+            base, hashlib.sha256(other_audio.read_bytes()).hexdigest()
+        )
+
+        self.assertEqual(selected.name, "2026-08-16 16：00：00-同名主题-2.md")
+
+    def test_legacy_delivery_name_remains_reusable(self) -> None:
+        with mock.patch.object(
+            onboarding, "transcribe_audio", side_effect=self._fake_transcribe
+        ) as provider:
+            captured = pc.capture_audio(
+                self.root,
+                config_dir=self.config,
+                provider="qwen-mlx",
+                agent_host="codex",
+                audio=self.audio,
+                language="Chinese",
+                title=None,
+                observed_at=None,
+            )
+            generated = Path(captured["markdown"]["path"])
+            legacy = self.root / "inbox" / f"{self.audio.stem}-录音转写.md"
+            generated.replace(legacy)
+            existing = pc.capture_audio(
+                self.root,
+                config_dir=self.config,
+                provider="qwen-mlx",
+                agent_host="codex",
+                audio=self.audio,
+                language="Chinese",
+                title=None,
+                observed_at=None,
+                check_only=True,
+            )
+
+        self.assertEqual(provider.call_count, 1)
+        self.assertEqual(existing["status"], "already_delivered")
+        self.assertEqual(Path(existing["markdown"]["path"]), legacy.resolve())
 
     def test_rerun_with_changed_segments_is_refused_by_schema_one_immutability(self) -> None:
         with mock.patch.object(

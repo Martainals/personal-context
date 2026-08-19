@@ -9,6 +9,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -21,6 +22,7 @@ from transcript_markdown import (
     ManualEditError,
     TranscriptMarkdownError,
     assert_safe_to_publish,
+    generated_markdown_identity,
     generated_markdown_metadata,
     load_transcript,
     publish_markdown,
@@ -33,6 +35,11 @@ MIN_SCHEMA_VERSION = 1
 MAX_SCHEMA_VERSION = 1
 ID_NAMESPACE = uuid.UUID("6e249f1a-7661-5fa8-8854-09541f14a9aa")
 RECORD_KINDS = {"Fact", "Opinion", "Decision", "Action", "Claim"}
+_RECORDING_TIMESTAMP = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})[ _T-](?P<hour>\d{2})[_:：-]"
+    r"(?P<minute>\d{2})[_:：-](?P<second>\d{2})"
+)
+_GENERIC_DELIVERY_TITLE = re.compile(r"(?:[-_ ]*(?:录音转写|完整逐字稿|逐字稿|录音))+$")
 EXPECTED_TABLES = {
     "schema_metadata",
     "processing_runs",
@@ -924,6 +931,22 @@ def import_transcript(
     return {"dry_run": False, "source_id": effective_source_id, "event_id": event_id, "counts": counts}
 
 
+def _filename_recorded_at(audio_path: Path) -> Optional[dt.datetime]:
+    matched = _RECORDING_TIMESTAMP.match(audio_path.stem)
+    if matched is None:
+        return None
+    try:
+        naive = dt.datetime.strptime(
+            f"{matched.group('date')} {matched.group('hour')}:{matched.group('minute')}:"
+            f"{matched.group('second')}",
+            "%Y-%m-%d %H:%M:%S",
+        )
+    except ValueError:
+        return None
+    local_zone = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+    return naive.replace(tzinfo=local_zone)
+
+
 def _capture_observed_at(root: Path, source_id: str, audio_path: Path) -> str:
     with connect(root, readonly=True) as connection:
         existing = connection.execute(
@@ -931,8 +954,97 @@ def _capture_observed_at(root: Path, source_id: str, audio_path: Path) -> str:
         ).fetchone()
     if existing:
         return str(existing[0])
-    timestamp = dt.datetime.fromtimestamp(audio_path.stat().st_mtime, tz=dt.timezone.utc)
-    return timestamp.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    timestamp = _filename_recorded_at(audio_path)
+    if timestamp is None:
+        timestamp = dt.datetime.fromtimestamp(audio_path.stat().st_mtime, tz=dt.timezone.utc)
+    return timestamp.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _delivery_title(value: Optional[str]) -> str:
+    cleaned = _GENERIC_DELIVERY_TITLE.sub("", str(value or "").strip())
+    cleaned = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", " ", cleaned)
+    cleaned = " ".join(cleaned.split()).strip(" .-")
+    return (cleaned or "未命名主题")[:32].rstrip()
+
+
+def _delivery_filename(audio_path: Path, title: str, observed_at: str) -> str:
+    matched = _RECORDING_TIMESTAMP.match(audio_path.stem)
+    if matched is not None:
+        date = matched.group("date")
+        hour = matched.group("hour")
+        minute = matched.group("minute")
+        second = matched.group("second")
+    else:
+        parsed = dt.datetime.fromisoformat(observed_at.replace("Z", "+00:00")).astimezone()
+        date = parsed.strftime("%Y-%m-%d")
+        hour = parsed.strftime("%H")
+        minute = parsed.strftime("%M")
+        second = parsed.strftime("%S")
+    return f"{date} {hour}：{minute}：{second}-{_delivery_title(title)}.md"
+
+
+def _available_delivery_path(base_path: Path, source_hash: str) -> Path:
+    """Select the stable path for this audio without overwriting another delivery."""
+    for number in range(1, 1000):
+        candidate = (
+            base_path
+            if number == 1
+            else base_path.with_name(f"{base_path.stem}-{number}{base_path.suffix}")
+        )
+        try:
+            identity = generated_markdown_identity(candidate)
+        except ManualEditError as exc:
+            raise ContextError(str(exc)) from exc
+        if identity is None or identity["source_audio_sha256"] == source_hash:
+            return candidate
+    raise ContextError("Too many transcript deliveries share the same recording time and title")
+
+
+def _latest_source_event(root: Path, source_id: str) -> Optional[dict[str, str]]:
+    with connect(root, readonly=True) as connection:
+        row = connection.execute(
+            "SELECT id, title, observed_at FROM events "
+            "WHERE source_id=? AND invalidated_at IS NULL "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (source_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "event_id": str(row["id"]),
+        "title": str(row["title"]),
+        "observed_at": str(row["observed_at"]),
+    }
+
+
+def _matching_delivery(
+    root: Path,
+    output_path: Path,
+    *,
+    source_id: str,
+    source_hash: str,
+) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    try:
+        assert_safe_to_publish(output_path, source_audio_sha256=source_hash)
+        delivery = generated_markdown_metadata(
+            output_path, source_audio_sha256=source_hash
+        )
+    except ManualEditError as exc:
+        raise ContextError(str(exc)) from exc
+    existing = (
+        _existing_delivery_record(
+            root,
+            source_id=source_id,
+            source_hash=source_hash,
+            segment_count=int(delivery["segments"]),
+            title=str(delivery["title"]) if delivery.get("title") else None,
+        )
+        if delivery is not None
+        else None
+    )
+    return delivery, existing
 
 
 def _existing_event_matches(
@@ -1023,6 +1135,7 @@ def capture_audio(
     observed_at: Optional[str],
     speaker_count: Optional[int] = None,
     rerun: bool = False,
+    check_only: bool = False,
 ) -> dict[str, Any]:
     """Capture one audio Source, import evidence, and publish only complete Markdown."""
     import personal_context_bootstrap as onboarding
@@ -1042,32 +1155,39 @@ def capture_audio(
     effective_observed_at = normalize_time(observed_at) if observed_at else _capture_observed_at(
         root, source_id, audio_path
     )
-    output_name = f"{audio_path.stem or '录音'}-录音转写.md"
     inbox_path = root / "inbox"
     if inbox_path.is_symlink():
         raise ContextError("Vault inbox must be a real directory, not a symbolic link.")
-    output_path = inbox_path / output_name
-    try:
-        assert_safe_to_publish(output_path, source_audio_sha256=source_hash)
-    except ManualEditError as exc:
-        raise ContextError(str(exc)) from exc
-    delivery = generated_markdown_metadata(
-        output_path, source_audio_sha256=source_hash
+    source_event = _latest_source_event(root, source_id)
+    effective_title = _delivery_title(
+        source_event["title"] if source_event is not None else title
     )
-    existing_delivery = (
-        _existing_delivery_record(
+    if source_event is not None:
+        effective_observed_at = source_event["observed_at"]
+    output_path = _available_delivery_path(
+        inbox_path / _delivery_filename(audio_path, effective_title, effective_observed_at),
+        source_hash,
+    )
+    legacy_output_path = inbox_path / f"{audio_path.stem or '录音'}-录音转写.md"
+    delivery: Optional[dict[str, Any]] = None
+    existing_delivery: Optional[dict[str, Any]] = None
+    for candidate in dict.fromkeys((output_path, legacy_output_path)):
+        candidate_delivery, candidate_existing = _matching_delivery(
             root,
+            candidate,
             source_id=source_id,
             source_hash=source_hash,
-            segment_count=int(delivery["segments"]),
-            title=str(delivery["title"]) if delivery.get("title") else None,
         )
-        if delivery is not None
-        else None
-    )
+        if candidate_delivery is not None and candidate_existing is not None:
+            output_path = candidate
+            delivery = candidate_delivery
+            existing_delivery = candidate_existing
+            break
     if delivery is not None and existing_delivery is not None:
         if rerun:
-            if title is not None and title != existing_delivery["title"]:
+            if title is not None and _delivery_title(title) != _delivery_title(
+                existing_delivery["title"]
+            ):
                 raise ContextError(
                     "Rerun title differs from the existing recording event; refusing to create a second event."
                 )
@@ -1087,6 +1207,19 @@ def capture_audio(
                 "mode": None,
                 "text_exposed_to_agent": False,
             }
+    if check_only:
+        return {
+            "status": "title_required",
+            "source_id": source_id,
+            "provider": None,
+            "cache": {"enabled": True, "status": "not_run"},
+            "mode": None,
+            "text_exposed_to_agent": False,
+        }
+    if source_event is not None and title is not None and _delivery_title(title) != effective_title:
+        raise ContextError(
+            "This recording already has an event title; refusing to create a second event with a new title."
+        )
 
     jobs_root = config_dir / "capture-jobs"
     jobs_root.mkdir(parents=True, exist_ok=True)
@@ -1107,7 +1240,7 @@ def capture_audio(
             audio=audio_path,
             output=transcript_path,
             language=language,
-            title=title,
+            title=effective_title,
             observed_at=effective_observed_at,
             speaker_count=speaker_count,
         )
@@ -1872,6 +2005,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly rerun an already delivered recording without creating a second Markdown file.",
     )
+    command.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Read-only preflight: return an existing delivery or report that a title is needed.",
+    )
 
     command = subparsers.add_parser(
         "transcription-cache-status",
@@ -2032,6 +2170,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 observed_at=args.observed_at,
                 speaker_count=args.speaker_count,
                 rerun=args.rerun,
+                check_only=args.check_only,
             )
         elif args.command == "transcription-cache-status":
             result = transcription_cache_status(

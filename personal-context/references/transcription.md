@@ -35,8 +35,9 @@ named audio file
 → cached high-context streaming Sortformer raw probabilities
 → cached ASR chunks of at most 240 seconds
 → cached Qwen forced-alignment chunks
+→ restore ASR punctuation onto aligned characters
 → cached speaker turns derived from raw probabilities
-→ cached confidence-aware final assembly
+→ cached confidence-aware sentence/pause assembly
 → private job transcript.v1.json
 → staged complete Markdown
 → existing ingest + import-transcript
@@ -46,9 +47,11 @@ named audio file
 
 Completed recordings use the pinned high-accuracy streaming profile: 340 new frames, 40 future-context frames, 40 FIFO frames, a 300-frame cache update period, and 188 speaker-cache frames. At 80 ms per diarization frame this gives 27.2 seconds of new audio plus 3.2 seconds of future context per main step. The Provider then consolidates probabilities over the whole recording before assigning words.
 
-When the user knows the number of speakers, pass `--speaker-count 1..4`. The Provider selects that many stable model slots over the whole recording, remaps them to contiguous `S01` labels, and treats brief activity in rejected slots as uncertain evidence rather than a new person. Without the hint, all four model slots remain available.
+Speaker count is automatic by default; do not ask the user. Only when the user volunteers a known count should the caller pass `--speaker-count 1..4`. The Provider then selects that many stable model slots over the whole recording, remaps them to contiguous `S01` labels, and treats brief activity in rejected slots as uncertain evidence rather than a new person. Without the hint, all four model slots remain available for automatic selection.
 
 Post-processing removes sub-100 ms speech fragments, bridges sub-150 ms silence gaps, repairs weak sub-240 ms speaker flips, and only merges a one- or two-character sentence fragment when the surrounding speaker agrees and the switch margin is low. Strong short backchannels remain separate.
+
+Qwen ASR text normally contains punctuation, while forced alignment may return only timed characters. Punctuation restoration aligns the two character streams with Unicode normalization and maps punctuation back only when their content similarity is at least 0.95. It never supplies missing words; a low-similarity chunk fails closed and keeps its aligned text unchanged. Final assembly starts a new segment at sentence-ending punctuation or a pause of at least 0.8 seconds. Punctuation restoration version and per-chunk status are included in processing provenance and the final-assembly cache key, so upgrading this lightweight stage reuses ASR, alignment and diarization artifacts.
 
 The Source must be the original audio. The default `capture-audio` path guarantees this association. Low-level callers must run `ingest` first and pass its `source_id` to `import-transcript`; otherwise the JSON file itself becomes the Source.
 
@@ -81,7 +84,7 @@ The five component keys are independently versioned:
 | ASR chunk | audio SHA, versions, ASR revision, pinned runtime package versions, language and chunk identity | speaker count, diarization rules, title, observed time |
 | alignment chunk | audio SHA, versions, aligner revision, pinned runtime package versions, language, chunk identity and ASR payload hash | speaker count, title, observed time |
 | speaker turns | raw-diarization payload hash, speaker count and post-processing rules | ASR, alignment, title, observed time |
-| final assembly | alignment payload hashes, speaker-turn payload hash and assembly rules | title and observed time |
+| final assembly | alignment payload hashes, ASR punctuation-restoration inputs/version, speaker-turn payload hash and assembly rules | title and observed time |
 
 Therefore changing `title` or `observed_at` only changes the final document metadata. Changing `speaker_count` or post-processing derives new turns from cached raw probabilities without rerunning ASR, alignment or the diarizer. A model, package, language, normalization, chunking or stage-version change invalidates only components whose key names that input.
 

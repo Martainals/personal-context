@@ -185,6 +185,26 @@ def assert_safe_to_publish(path: Path, *, source_audio_sha256: str) -> None:
     _safe_existing_fingerprint(path, source_audio_sha256)
 
 
+def generated_markdown_identity(path: Path) -> Optional[dict[str, Any]]:
+    """Return the source identity for one intact generated delivery, never its body."""
+    if path.is_symlink():
+        raise ManualEditError(f"Refusing to inspect unsafe Markdown path: {path}")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise ManualEditError(f"Refusing to inspect unsafe Markdown path: {path}")
+    try:
+        current = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ManualEditError(f"Cannot validate existing Markdown {path}: {exc}") from exc
+    source_hash, body_hash, segment_count = _parse_generated(current)
+    return {
+        "source_audio_sha256": source_hash,
+        "body_sha256": body_hash,
+        "segments": segment_count,
+    }
+
+
 def generated_markdown_metadata(
     path: Path, *, source_audio_sha256: str
 ) -> Optional[dict[str, Any]]:

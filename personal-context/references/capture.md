@@ -13,12 +13,16 @@ Use `capture-audio` only after the user explicitly asks to transcribe a named re
 ```bash
 scripts/context capture-audio \
   --root <vault> --agent-host <host> \
-  --audio <audio> --language Chinese [--speaker-count 1..4]
+  --audio <audio> --language Chinese --check-only
 ```
 
 The command checks the current Schema and delegates consent, Provider readiness and local transcription to the existing onboarding control plane. It reuses `ingest` and `import-transcript`; it does not maintain parallel Source, Schema or import logic.
 
-Preflight checks only the exact `<audio-stem>-录音转写.md` path. If that generated file is intact, names the same audio hash and has matching Source/Event evidence, the default command returns `already_delivered` without invoking the Provider. Use `--rerun` only after an explicit user request. A rerun with different explicit title or observation time is refused rather than creating a second Event. Schema 1 also refuses a rerun whose Segment content or speaker assignment differs from immutable imported evidence; a future governed transcript-revision workflow is required to accept such corrections. The normal workflow does not scan other filenames or directories for renamed copies.
+`--check-only` is a read-only preflight. It returns an intact matching delivery or `title_required`; it does not invoke the Provider, ingest a Source, create an Event, populate a cache or publish a file.
+
+When `title_required` is returned in `agent-assisted` mode, the Agent may use low-level `transcribe-audio` with an output path in a private temporary directory outside the Vault and Skill checkout, read only `segments[].text`, and create a concise 8–20 Chinese-character content title. The title names the central topic without generic suffixes such as “录音转写” or “逐字稿”. The Agent must remove the temporary JSON on every exit, then run the normal command with `--title`; the stage cache prevents the heavy model stages from running twice. This is title preparation only: it does not produce a summary or long-term Memory. In `strict-local` mode the Agent must not inspect transcript text; use a user-supplied title or `未命名主题`.
+
+Normal preflight checks the exact new title-based path and the legacy `<audio-stem>-录音转写.md` path. If an intact generated file names the same audio hash and has matching Source/Event evidence, the command returns `already_delivered` without invoking the Provider. Use `--rerun` only after an explicit user request. A rerun with a different explicit title or observation time is refused rather than creating a second Event. Schema 1 also refuses a rerun whose Segment content or speaker assignment differs from immutable imported evidence; a future governed transcript-revision workflow is required to accept such corrections. The normal workflow does not scan other filenames or directories for renamed copies.
 
 The ordered failure boundary is:
 
@@ -27,7 +31,7 @@ The ordered failure boundary is:
 3. Validate the source hash and full transcript, then render a complete staged Markdown.
 4. Idempotently ingest the original audio Source.
 5. Dry-run and atomically import the transcript with that audio `source_id`. Every speech Segment becomes a Claim Statement; no Memory is created or approved.
-6. Atomically publish `<vault>/inbox/<audio-stem>-录音转写.md` and remove the private job on every exit.
+6. Atomically publish `<vault>/inbox/YYYY-MM-DD HH：MM：SS-内容标题.md` and remove the private job on every exit. Recorder timestamps parsed from the original filename take precedence over filesystem observation time. A valid delivery for different audio at the same path causes a `-2`, `-3` suffix rather than overwrite.
 
 Provider or rendering failure occurs before Source insertion. Import failure may leave the verified audio Source, but the Event transaction rolls back and inbox remains unchanged. A final publication failure may leave a complete imported Event; stable IDs and event-content comparison make the next run recoverable without duplicate logical records.
 
@@ -35,7 +39,7 @@ The Markdown contains title, `完整转写` status, duration, segment count, `HH
 
 Successful capture retains one immutable original audio Source in `blobs/`. It never deletes or moves the caller's input file. Same-content ingestion remains content-addressed and idempotent, but no separate rename-detection workflow runs during ordinary capture.
 
-Normal stdout contains only Source/Event IDs, counts, Markdown path/size/hashes, processing mode, Provider and cache metadata. It never contains transcript text. The workflow does not generate a summary or create/approve long-term Memory; the production audio Provider emits no CandidateMemory by default.
+Normal stdout contains only Source/Event IDs, counts, Markdown path/size/hashes, processing mode, Provider and cache metadata. It never contains transcript text. Speaker count is automatic unless the user explicitly supplies a 1–4 person hint. The workflow does not generate a summary or create/approve long-term Memory; the production audio Provider emits no CandidateMemory by default.
 
 ## Structured transcript JSON V1
 

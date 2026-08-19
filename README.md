@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="Skill version 0.5.1" src="https://img.shields.io/badge/skill-0.5.1-0f766e?style=flat-square">
+  <img alt="Skill version 0.6.0" src="https://img.shields.io/badge/skill-0.6.0-0f766e?style=flat-square">
   <img alt="Schema version 1" src="https://img.shields.io/badge/schema-1-b7791f?style=flat-square">
   <img alt="Agent Skills open format" src="https://img.shields.io/badge/format-Agent%20Skills-334155?style=flat-square">
   <img alt="Python 3.9 or newer" src="https://img.shields.io/badge/core-Python%203.9%2B-334155?style=flat-square">
@@ -137,10 +137,12 @@ Agent 应将录音落为一个明确的本地文件路径，再使用高层交�
   --agent-host codex \
   --audio /path/to/recording.m4a \
   --language Chinese \
-  --speaker-count 2
+  --check-only
 ```
 
-命令会依次预检原音频、在私有 job 中生成并验证 `transcript.v1`、采集原音频 Source、原子导入证据，最后才把 `<audio-stem>-录音转写.md` 原子发布到 `inbox/`。成功后 job JSON 删除；Provider、渲染或导入失败时，inbox 不出现 JSON 或半成品。标准输出只含 ID、计数、Markdown 元数据及 Provider/cache 元数据，不打印正文。
+只读预检已有交付时直接返回，否则报告需要内容标题。在 `agent-assisted` 模式下，Agent 可把低层转写写进 Vault 外的私有临时目录，依据正文生成 8–20 个中文字的具体标题，删除临时 JSON 后再执行 `capture-audio --title <内容标题>`。第二次调用复用阶段缓存，不重复运行重模型。`strict-local` 模式不允许 Agent 为标题读取正文，应使用用户标题或 `未命名主题`。
+
+正式命令会依次预检原音频、在私有 job 中生成并验证 `transcript.v1`、采集原音频 Source、原子导入证据，最后才把 `YYYY-MM-DD HH：MM：SS-内容标题.md` 原子发布到 `inbox/`。录音文件名中的时间优先；同一时间和标题冲突时自动追加 `-2`。成功后 job JSON 删除；Provider、渲染或导入失败时，inbox 不出现 JSON 或半成品。标准输出只含 ID、计数、Markdown 元数据及 Provider/cache 元数据，不打印正文。
 
 Markdown 包含标题、完整状态、总时长、人物标签与按 `HH:MM:SS` 排序的全部逐字稿。不可见完整性标记允许安全重跑；如果用户编辑过文件，系统拒绝覆盖并保留原件。
 
@@ -148,7 +150,9 @@ Markdown 包含标题、完整状态、总时长、人物标签与按 `HH:MM:SS`
 
 Vault 会在 `blobs/` 中保留一份不可变原音频；系统不会删除或移动用户提供位置的原件。
 
-`--speaker-count` 是单次录音的可选提示；确定人数时应显式填写 1–4，不确定时省略并自动检测。已录完的文件默认使用高上下文 Sortformer 配置，再依据整段录音的置信度统一说话人通道、清除短暂跳变并组装发言轮次。
+人数默认自动判断，不需要询问用户；只有用户主动明确人数时才传 `--speaker-count 1..4`。已录完的文件默认使用高上下文 Sortformer 配置，再依据整段录音的置信度统一说话人通道、清除短暂跳变并组装发言轮次。
+
+ASR 已识别出的标点会在逐词对齐后安全贴回；只有正文字符相似度达到 0.95 才执行，绝不补猜原词。最终逐字稿按句末标点或至少 0.8 秒停顿断段，改善长段无标点、难阅读和不利于后续归纳的问题。
 
 重复处理同一录音时默认复用私有阶段产物，并用稳定 ID 避免重复 Source、Event 和 Segment。标题、观察时间、人数提示和说话人后处理调整不会让 ASR 或逐词对齐失效；人数与后处理会从已缓存的原始说话人概率重新派生。
 
@@ -239,14 +243,14 @@ Vault 由用户选择，是唯一权威数据层：
 
 | 项目 | 当前值 |
 |---|---|
-| Skill | `0.5.1` |
+| Skill | `0.6.0` |
 | SQLite Schema | `1` |
 | Consent notice | `2` |
 | Provider contract | `1` |
 | Artifact contract | `1` |
 | qwen-mlx profile | `3` |
 
-0.5.1 增加明确触发、已有交付短路、可读缓存状态和空间状态，不改变 Schema、Provider/transcript contract、Artifact contract、Qwen profile 或 Notice，因此无需迁移数据库、重装模型或更新许可收据。
+0.6.0 增加 ASR 标点恢复、句子/停顿断段、默认自动人数判断和内容标题文件名。它不改变 Schema、Provider/transcript contract、Artifact contract、Qwen profile 或 Notice；旧的 ASR、逐词对齐和说话人缓存继续可用，无需迁移数据库、重装模型或更新许可收据。
 
 项目根目录的 [`AGENTS.md`](./AGENTS.md) 是后续 Agent 开发和升级的唯一维护章程。`CLAUDE.md`、`GEMINI.md` 只引用它，避免多份规则漂移；Codex 的 `personal-context/agents/openai.yaml` 仅是可选界面元数据。
 
