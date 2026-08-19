@@ -16,4 +16,6 @@
 - Treat cached ASR text, alignment, raw diarization probabilities, speaker turns, and assembled segments as sensitive personal data. The store uses checksummed JSON/gzip, `0700` directories, `0600` files and locks where supported, and atomic writes.
 - Never store pickle, voiceprints, speaker embeddings, cross-recording identity features, secrets, or automatic retention metadata in artifacts. Raw diarization probabilities are recording-local activity evidence, not biometric identity.
 - Artifact cleanup is manual. `transcription-cache-status` is metadata-only; `transcription-cache-prune` defaults to dry-run and requires explicit `--apply` for deletion. Never run it in the background or as an automatic fallback.
+- Cache and storage status may expose names, Source IDs, hashes, sizes, counts, paths, last-write times and integrity states. They must never return cached ASR text, Markdown bodies, transcript JSON payloads or transient-file contents. Status never updates access times or creates retention metadata.
+- Successful capture keeps one immutable audio copy in the Vault and never deletes or moves the caller's original file. Source retirement is not available in Schema 1.
 - Before installation or copying into a shared location, inspect for personal absolute paths and real content.

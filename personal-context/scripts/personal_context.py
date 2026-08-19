@@ -21,6 +21,7 @@ from transcript_markdown import (
     ManualEditError,
     TranscriptMarkdownError,
     assert_safe_to_publish,
+    generated_markdown_metadata,
     load_transcript,
     publish_markdown,
     render_transcript_markdown,
@@ -967,6 +968,49 @@ def _existing_event_matches(
     return actual == expected
 
 
+def _existing_delivery_record(
+    root: Path,
+    *,
+    source_id: str,
+    source_hash: str,
+    segment_count: int,
+    title: Optional[str],
+) -> Optional[dict[str, Any]]:
+    with connect(root, readonly=True) as connection:
+        row = connection.execute(
+            "SELECT e.id, e.title, e.observed_at, COUNT(sg.id) AS segment_count "
+            "FROM events e JOIN sources s ON s.id=e.source_id "
+            "LEFT JOIN segments sg ON sg.event_id=e.id "
+            "WHERE s.id=? AND s.content_hash=? AND e.invalidated_at IS NULL "
+            "AND (? IS NULL OR e.title=?) "
+            "GROUP BY e.id, e.title, e.observed_at "
+            "HAVING COUNT(sg.id)=? ORDER BY e.created_at DESC, e.id DESC LIMIT 1",
+            (source_id, source_hash, title, title, segment_count),
+        ).fetchone()
+        if row is None:
+            return None
+        counts = {"events": 1}
+        for table in (
+            "segments",
+            "statements",
+            "entities",
+            "decisions",
+            "actions",
+            "claims",
+            "relationships",
+            "candidate_memories",
+        ):
+            counts[table] = connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE event_id=?", (row["id"],)
+            ).fetchone()[0]
+    return {
+        "event_id": str(row["id"]),
+        "title": str(row["title"]),
+        "observed_at": str(row["observed_at"]),
+        "counts": counts,
+    }
+
+
 def capture_audio(
     root: Path,
     *,
@@ -978,6 +1022,7 @@ def capture_audio(
     title: Optional[str],
     observed_at: Optional[str],
     speaker_count: Optional[int] = None,
+    rerun: bool = False,
 ) -> dict[str, Any]:
     """Capture one audio Source, import evidence, and publish only complete Markdown."""
     import personal_context_bootstrap as onboarding
@@ -1006,6 +1051,42 @@ def capture_audio(
         assert_safe_to_publish(output_path, source_audio_sha256=source_hash)
     except ManualEditError as exc:
         raise ContextError(str(exc)) from exc
+    delivery = generated_markdown_metadata(
+        output_path, source_audio_sha256=source_hash
+    )
+    existing_delivery = (
+        _existing_delivery_record(
+            root,
+            source_id=source_id,
+            source_hash=source_hash,
+            segment_count=int(delivery["segments"]),
+            title=str(delivery["title"]) if delivery.get("title") else None,
+        )
+        if delivery is not None
+        else None
+    )
+    if delivery is not None and existing_delivery is not None:
+        if rerun:
+            if title is not None and title != existing_delivery["title"]:
+                raise ContextError(
+                    "Rerun title differs from the existing recording event; refusing to create a second event."
+                )
+            if observed_at is not None and normalize_time(observed_at) != existing_delivery["observed_at"]:
+                raise ContextError(
+                    "Rerun observed_at differs from the existing recording event; refusing to create a second event."
+                )
+        else:
+            return {
+                "status": "already_delivered",
+                "source_id": source_id,
+                "event_id": existing_delivery["event_id"],
+                "counts": existing_delivery["counts"],
+                "markdown": delivery,
+                "provider": None,
+                "cache": {"enabled": True, "status": "not_run"},
+                "mode": None,
+                "text_exposed_to_agent": False,
+            }
 
     jobs_root = config_dir / "capture-jobs"
     jobs_root.mkdir(parents=True, exist_ok=True)
@@ -1082,6 +1163,206 @@ def capture_audio(
         "cache": transcribe_result.get("cache"),
         "mode": transcribe_result.get("mode"),
         "text_exposed_to_agent": False,
+    }
+
+
+def _cache_hash_for_source(root: Path, source_id: str) -> str:
+    with connect(root, readonly=True) as connection:
+        row = connection.execute(
+            "SELECT content_hash FROM sources WHERE id=?", (source_id,)
+        ).fetchone()
+    if row is None:
+        raise ContextError(f"Unknown source_id: {source_id}")
+    return str(row["content_hash"])
+
+
+def _cache_source_index(root: Path, hashes: Sequence[str]) -> dict[str, dict[str, Any]]:
+    if not hashes or not db_path(root).is_file():
+        return {}
+    placeholders = ",".join("?" for _ in hashes)
+    try:
+        with connect(root, readonly=True) as connection:
+            rows = connection.execute(
+                "SELECT id, content_hash, original_name, media_type, size_bytes "
+                f"FROM sources WHERE content_hash IN ({placeholders})",
+                list(hashes),
+            ).fetchall()
+    except (ContextError, sqlite3.DatabaseError):
+        return {}
+    return {
+        str(row["content_hash"]): {
+            "source_id": str(row["id"]),
+            "original_name": str(row["original_name"]),
+            "source_media_type": str(row["media_type"]),
+            "source_bytes": int(row["size_bytes"]),
+        }
+        for row in rows
+    }
+
+
+def _attach_cache_sources(root: Path, items: list[dict[str, Any]]) -> None:
+    index = _cache_source_index(root, [str(item["audio_sha256"]) for item in items])
+    for item in items:
+        source = index.get(str(item["audio_sha256"]))
+        if source is None:
+            item["source_status"] = "unbound"
+            item["source_id"] = None
+            item["original_name"] = None
+        else:
+            item["source_status"] = "linked"
+            item.update(source)
+
+
+def transcription_cache_status(
+    root: Path,
+    *,
+    config_dir: Path,
+    audio: Optional[Path] = None,
+    source_id: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict[str, Any]:
+    import personal_context_bootstrap as onboarding
+
+    if audio is not None and source_id is not None:
+        raise ContextError("Select cache by audio path or source_id, not both.")
+    if limit is not None and limit < 1:
+        raise ContextError("Cache status limit must be at least 1.")
+    result = onboarding.transcription_cache_status(
+        root,
+        config_dir=config_dir,
+        audio=audio,
+        audio_sha256=_cache_hash_for_source(root, source_id) if source_id else None,
+    )
+    recordings = list(result["recordings"])
+    _attach_cache_sources(root, recordings)
+    recordings.sort(
+        key=lambda item: (str(item.get("last_written_at") or ""), str(item["audio_sha256"])),
+        reverse=True,
+    )
+    result["total_recording_count"] = len(recordings)
+    if limit is not None:
+        recordings = recordings[:limit]
+    result["recordings"] = recordings
+    result["recording_count"] = len(recordings)
+    return result
+
+
+def transcription_cache_prune(
+    root: Path,
+    *,
+    config_dir: Path,
+    audio: Optional[Path] = None,
+    source_id: Optional[str] = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    import personal_context_bootstrap as onboarding
+
+    if audio is not None and source_id is not None:
+        raise ContextError("Select cache by audio path or source_id, not both.")
+    result = onboarding.transcription_cache_prune(
+        root,
+        config_dir=config_dir,
+        audio=audio,
+        audio_sha256=_cache_hash_for_source(root, source_id) if source_id else None,
+        apply=apply,
+    )
+    targets = list(result["targets"])
+    _attach_cache_sources(root, targets)
+    result["targets"] = targets
+    return result
+
+
+def _filesystem_inventory(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"files": 0, "bytes": 0, "last_written_at": None}
+    if path.is_symlink():
+        return {"files": 0, "bytes": 0, "last_written_at": None, "unsafe": True}
+    candidates = [path] if path.is_file() else list(path.rglob("*"))
+    files = [item for item in candidates if item.is_file() and not item.is_symlink()]
+    total = sum(item.stat().st_size for item in files)
+    latest = max((item.stat().st_mtime for item in files), default=None)
+    return {
+        "files": len(files),
+        "bytes": total,
+        "last_written_at": (
+            dt.datetime.fromtimestamp(latest, tz=dt.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+            if latest is not None
+            else None
+        ),
+    }
+
+
+def _named_directory_inventory(parent: Path, prefix: str) -> dict[str, Any]:
+    directories = (
+        [item for item in parent.iterdir() if item.is_dir() and not item.is_symlink() and item.name.startswith(prefix)]
+        if parent.is_dir() and not parent.is_symlink()
+        else []
+    )
+    inventories = [_filesystem_inventory(item) for item in directories]
+    return {
+        "jobs": len(directories),
+        "files": sum(int(item["files"]) for item in inventories),
+        "bytes": sum(int(item["bytes"]) for item in inventories),
+        "last_written_at": max(
+            (str(item["last_written_at"]) for item in inventories if item["last_written_at"]),
+            default=None,
+        ),
+    }
+
+
+def storage_status(root: Path, *, config_dir: Path) -> dict[str, Any]:
+    import personal_context_bootstrap as onboarding
+    from providers.artifacts import vault_scope_hash
+
+    root = root.expanduser().resolve()
+    config_dir = config_dir.expanduser().resolve()
+    with connect(root, readonly=True) as connection:
+        source_row = connection.execute(
+            "SELECT COUNT(*) AS recordings, COALESCE(SUM(size_bytes), 0) AS bytes FROM sources"
+        ).fetchone()
+    cache = onboarding.transcription_cache_status(root, config_dir=config_dir)
+    runtime = config_dir / "runtime"
+    temp_root = Path(tempfile.gettempdir())
+    lock_root = (
+        config_dir
+        / "artifacts"
+        / vault_scope_hash(root)
+        / ".locks"
+    )
+    return {
+        "status": "ok",
+        "vault_root": str(root),
+        "source_blobs": {
+            "recordings": int(source_row["recordings"]),
+            "bytes": int(source_row["bytes"]),
+            "on_disk": _filesystem_inventory(root / "blobs"),
+        },
+        "database": _filesystem_inventory(db_path(root)),
+        "inbox": _filesystem_inventory(root / "inbox"),
+        "transcription_cache": {
+            "recordings": int(cache["recording_count"]),
+            "artifacts": int(cache["valid_artifacts"]) + int(cache["corrupt_artifacts"]),
+            "bytes": int(cache["bytes"]),
+            "corrupt_artifacts": int(cache["corrupt_artifacts"]),
+        },
+        "runtime": {
+            "models": _filesystem_inventory(runtime / "models"),
+            "package_cache": _filesystem_inventory(runtime / "cache"),
+            "environment": {
+                name: _filesystem_inventory(runtime / name)
+                for name in ("bootstrap", "python", "venv", "huggingface")
+            },
+        },
+        "transient_jobs": _named_directory_inventory(
+            config_dir / "capture-jobs", "capture-audio-"
+        ),
+        "normalized_audio_temp": _named_directory_inventory(
+            temp_root, "personal-context-audio-"
+        ),
+        "cache_locks": _filesystem_inventory(lock_root),
     }
 
 
@@ -1586,6 +1867,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     command.add_argument("--title")
     command.add_argument("--observed-at", help="Optional ISO-8601 event observation time.")
+    command.add_argument(
+        "--rerun",
+        action="store_true",
+        help="Explicitly rerun an already delivered recording without creating a second Markdown file.",
+    )
 
     command = subparsers.add_parser(
         "transcription-cache-status",
@@ -1593,7 +1879,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_root(command)
     _add_bootstrap_options(command, include_provider=False)
-    command.add_argument("--audio", help="Limit status to the cache entry for one named audio file.")
+    cache_selector = command.add_mutually_exclusive_group()
+    cache_selector.add_argument("--audio", help="Limit status to one named audio file.")
+    cache_selector.add_argument("--source-id", help="Limit status to one ingested Source ID.")
+    command.add_argument("--limit", type=int, help="Return only the most recently written cache entries.")
 
     command = subparsers.add_parser(
         "transcription-cache-prune",
@@ -1601,10 +1890,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_root(command)
     _add_bootstrap_options(command, include_provider=False)
-    command.add_argument("--audio", help="Limit pruning to the cache entry for one named audio file.")
+    cache_selector = command.add_mutually_exclusive_group()
+    cache_selector.add_argument("--audio", help="Limit pruning to one named audio file.")
+    cache_selector.add_argument("--source-id", help="Limit pruning to one ingested Source ID.")
     prune_mode = command.add_mutually_exclusive_group()
     prune_mode.add_argument("--dry-run", action="store_true", help="Preview only; this is the default.")
     prune_mode.add_argument("--apply", action="store_true", help="Remove the selected cache entries after previewing.")
+
+    command = subparsers.add_parser(
+        "storage-status",
+        help="Inspect vault, cache, runtime, and transient storage metadata without reading content.",
+    )
+    _add_root(command)
+    _add_bootstrap_options(command, include_provider=False)
 
     command = subparsers.add_parser("doctor", help="Check directories, database integrity, schema, and compatibility.")
     _add_root(command)
@@ -1733,19 +2031,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 title=args.title,
                 observed_at=args.observed_at,
                 speaker_count=args.speaker_count,
+                rerun=args.rerun,
             )
         elif args.command == "transcription-cache-status":
-            result = onboarding.transcription_cache_status(
+            result = transcription_cache_status(
                 root,
                 config_dir=onboarding.resolve_config_dir(args.config_dir),
                 audio=Path(args.audio) if args.audio else None,
+                source_id=args.source_id,
+                limit=args.limit,
             )
         elif args.command == "transcription-cache-prune":
-            result = onboarding.transcription_cache_prune(
+            result = transcription_cache_prune(
                 root,
                 config_dir=onboarding.resolve_config_dir(args.config_dir),
                 audio=Path(args.audio) if args.audio else None,
+                source_id=args.source_id,
                 apply=args.apply,
+            )
+        elif args.command == "storage-status":
+            result = storage_status(
+                root,
+                config_dir=onboarding.resolve_config_dir(args.config_dir),
             )
         elif args.command == "doctor":
             result = doctor(root)

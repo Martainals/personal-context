@@ -54,6 +54,8 @@ Capture and long-term memory formation are separate transactions and separate co
 
 `capture-audio` orders work so Provider and Markdown validation happen before database writes, transcript import commits before inbox publication, and the job directory is removed on every exit. An import failure can leave only the already-verified immutable audio Source; it cannot leave a partial Event or inbox delivery. If final publication fails after import, stable IDs make a retry safe. A manually edited generated Markdown fails integrity preflight before Provider or database work and is never replaced.
 
+An intact generated delivery with matching Source/Event evidence is a terminal default result: `capture-audio` returns its metadata without invoking the Provider. Only an explicit rerun proceeds beyond that boundary, and it cannot silently change the existing Event title or observation time. Status commands remain metadata-only views over the Vault, private artifacts and known runtime directories.
+
 ## Determinism and transactions
 
 - Source IDs derive from SHA-256 content hashes.

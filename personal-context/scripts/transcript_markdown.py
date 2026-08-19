@@ -185,6 +185,32 @@ def assert_safe_to_publish(path: Path, *, source_audio_sha256: str) -> None:
     _safe_existing_fingerprint(path, source_audio_sha256)
 
 
+def generated_markdown_metadata(
+    path: Path, *, source_audio_sha256: str
+) -> Optional[dict[str, Any]]:
+    """Return integrity metadata for one existing generated delivery, never its text."""
+    fingerprint = _safe_existing_fingerprint(path, source_audio_sha256)
+    if fingerprint is None:
+        return None
+    try:
+        current = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ManualEditError(f"Cannot validate existing Markdown {path}: {exc}") from exc
+    existing_source, body_hash, segment_count = _parse_generated(current)
+    lines = current.splitlines()
+    first_line = lines[0] if lines else ""
+    title = first_line[2:].strip() if first_line.startswith("# ") else None
+    return {
+        "path": str(path.expanduser().absolute()),
+        "bytes": len(current.encode("utf-8")),
+        "sha256": fingerprint,
+        "body_sha256": body_hash,
+        "source_audio_sha256": existing_source,
+        "segments": segment_count,
+        "title": title,
+    }
+
+
 def publish_markdown(path: Path, rendered: RenderedMarkdown) -> dict[str, Any]:
     path = path.expanduser().absolute()
     path.parent.mkdir(parents=True, exist_ok=True)

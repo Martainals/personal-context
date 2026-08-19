@@ -214,6 +214,10 @@ class CaptureAudioTests(unittest.TestCase):
         self.assertEqual(result["counts"]["segments"], 2)
         self.assertEqual(result["cache"], {"enabled": True, "hits": 4, "computed": 1})
         self.assertNotIn("机密第一段", stdout)
+        self.assertTrue(self.audio.is_file())
+        blobs = [path for path in (self.root / "blobs").rglob("*") if path.is_file()]
+        self.assertEqual(len(blobs), 1)
+        self.assertEqual(blobs[0].read_bytes(), self.audio.read_bytes())
         with pc.connect(self.root, readonly=True) as connection:
             source = connection.execute(
                 "SELECT id, original_name FROM sources WHERE id=?", (result["source_id"],)
@@ -227,7 +231,7 @@ class CaptureAudioTests(unittest.TestCase):
             )
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0], 0)
 
-    def test_repeating_the_same_audio_is_logically_idempotent(self) -> None:
+    def test_repeating_the_same_audio_returns_existing_delivery_without_provider(self) -> None:
         results = []
         with mock.patch.object(
             onboarding, "transcribe_audio", side_effect=self._fake_transcribe
@@ -247,12 +251,12 @@ class CaptureAudioTests(unittest.TestCase):
                     )
                 )
 
+        self.assertEqual(provider.call_count, 1)
+        self.assertEqual(results[0]["status"], "captured")
+        self.assertEqual(results[1]["status"], "already_delivered")
         self.assertEqual(results[0]["source_id"], results[1]["source_id"])
         self.assertEqual(results[0]["event_id"], results[1]["event_id"])
-        self.assertEqual(
-            provider.call_args_list[0].kwargs["observed_at"],
-            provider.call_args_list[1].kwargs["observed_at"],
-        )
+        self.assertEqual(results[1]["cache"], {"enabled": True, "status": "not_run"})
         with pc.connect(self.root, readonly=True) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM sources").fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM events").fetchone()[0], 1)
@@ -266,6 +270,104 @@ class CaptureAudioTests(unittest.TestCase):
             sorted(path.name for path in (self.root / "inbox").iterdir()),
             ["用户录音-录音转写.md"],
         )
+
+    def test_explicit_rerun_reuses_one_delivery_and_rejects_metadata_drift(self) -> None:
+        with mock.patch.object(
+            onboarding, "transcribe_audio", side_effect=self._fake_transcribe
+        ) as provider:
+            first = pc.capture_audio(
+                self.root,
+                config_dir=self.config,
+                provider="qwen-mlx",
+                agent_host="codex",
+                audio=self.audio,
+                language="Chinese",
+                title=None,
+                observed_at="2026-08-16T08:00:00Z",
+                speaker_count=2,
+            )
+            rerun = pc.capture_audio(
+                self.root,
+                config_dir=self.config,
+                provider="qwen-mlx",
+                agent_host="codex",
+                audio=self.audio,
+                language="Chinese",
+                title=None,
+                observed_at="2026-08-16T08:00:00Z",
+                speaker_count=2,
+                rerun=True,
+            )
+            with self.assertRaises(pc.ContextError):
+                pc.capture_audio(
+                    self.root,
+                    config_dir=self.config,
+                    provider="qwen-mlx",
+                    agent_host="codex",
+                    audio=self.audio,
+                    language="Chinese",
+                    title="另一个标题",
+                    observed_at="2026-08-16T08:00:00Z",
+                    speaker_count=2,
+                    rerun=True,
+                )
+
+        self.assertEqual(provider.call_count, 2)
+        self.assertEqual(first["event_id"], rerun["event_id"])
+        self.assertEqual(self._db_count("events"), 1)
+        self.assertEqual(self._db_count("segments"), 2)
+        self.assertEqual(
+            sorted(path.name for path in (self.root / "inbox").iterdir()),
+            ["用户录音-录音转写.md"],
+        )
+
+    def test_rerun_with_changed_segments_is_refused_by_schema_one_immutability(self) -> None:
+        with mock.patch.object(
+            onboarding, "transcribe_audio", side_effect=self._fake_transcribe
+        ):
+            first = pc.capture_audio(
+                self.root,
+                config_dir=self.config,
+                provider="qwen-mlx",
+                agent_host="codex",
+                audio=self.audio,
+                language="Chinese",
+                title=None,
+                observed_at="2026-08-16T08:00:00Z",
+                speaker_count=2,
+            )
+        target = Path(first["markdown"]["path"])
+        before = target.read_bytes()
+
+        def changed_transcribe(root: Path, **kwargs: Any) -> dict[str, Any]:
+            result = self._fake_transcribe(root, **kwargs)
+            output = Path(kwargs["output"])
+            document = json.loads(output.read_text(encoding="utf-8"))
+            document["segments"][0]["speaker"] = "S02"
+            output.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+            return result
+
+        with mock.patch.object(
+            onboarding, "transcribe_audio", side_effect=changed_transcribe
+        ):
+            with self.assertRaises(pc.ContextError):
+                pc.capture_audio(
+                    self.root,
+                    config_dir=self.config,
+                    provider="qwen-mlx",
+                    agent_host="codex",
+                    audio=self.audio,
+                    language="Chinese",
+                    title=None,
+                    observed_at="2026-08-16T08:00:00Z",
+                    speaker_count=2,
+                    rerun=True,
+                )
+
+        self.assertEqual(target.read_bytes(), before)
+        self.assertEqual(self._db_count("events"), 1)
+        self.assertEqual(self._db_count("segments"), 2)
+        self.assertFalse(any(self.config.rglob("*.json")))
 
     def test_provider_failure_leaves_no_inbox_or_private_job_transcript(self) -> None:
         with mock.patch.object(

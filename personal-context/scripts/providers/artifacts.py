@@ -8,6 +8,7 @@ never uses pickle or another executable serialization format.
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import gzip
 import hashlib
 import json
@@ -223,9 +224,18 @@ class ArtifactStore:
 
 def _inspect_artifact(path: Path, recording_dir: Path) -> dict[str, Any]:
     relative = path.relative_to(recording_dir)
+    stat = path.stat() if path.exists() and not path.is_symlink() else None
     result = {
         "path": relative.as_posix(),
-        "bytes": path.stat().st_size if path.exists() and not path.is_symlink() else 0,
+        "bytes": stat.st_size if stat is not None else 0,
+        "last_written_at": (
+            dt.datetime.fromtimestamp(stat.st_mtime, tz=dt.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+            if stat is not None
+            else None
+        ),
         "status": "corrupt",
     }
     try:
@@ -288,10 +298,25 @@ def inspect_artifacts(
         corrupt = len(inspected) - valid
         size = sum(int(item["bytes"]) for item in inspected)
         stages: dict[str, int] = {}
+        stage_details: dict[str, dict[str, Any]] = {}
         for item in inspected:
             if item["status"] == "valid":
                 stage = str(item["stage"])
                 stages[stage] = stages.get(stage, 0) + 1
+                detail = stage_details.setdefault(
+                    stage, {"artifacts": 0, "bytes": 0, "last_written_at": None}
+                )
+                detail["artifacts"] += 1
+                detail["bytes"] += int(item["bytes"])
+                if item["last_written_at"] and (
+                    detail["last_written_at"] is None
+                    or item["last_written_at"] > detail["last_written_at"]
+                ):
+                    detail["last_written_at"] = item["last_written_at"]
+        last_written_at = max(
+            (str(item["last_written_at"]) for item in inspected if item["last_written_at"]),
+            default=None,
+        )
         recordings.append(
             {
                 "audio_sha256": recording_dir.name,
@@ -300,11 +325,17 @@ def inspect_artifacts(
                 "corrupt_artifacts": corrupt,
                 "bytes": size,
                 "stages": stages,
+                "stage_details": stage_details,
+                "last_written_at": last_written_at,
             }
         )
         valid_total += valid
         corrupt_total += corrupt
         byte_total += size
+    recordings.sort(
+        key=lambda item: (str(item["last_written_at"] or ""), str(item["audio_sha256"])),
+        reverse=True,
+    )
     return {
         "artifact_contract": ARTIFACT_CONTRACT_VERSION,
         "artifact_root": str(base),

@@ -675,12 +675,18 @@ def _optional_audio_hash(audio: Optional[Path]) -> Optional[str]:
 
 
 def transcription_cache_status(
-    root: Path, *, config_dir: Path, audio: Optional[Path] = None
+    root: Path,
+    *,
+    config_dir: Path,
+    audio: Optional[Path] = None,
+    audio_sha256: Optional[str] = None,
 ) -> dict[str, Any]:
+    if audio is not None and audio_sha256 is not None:
+        raise BootstrapError("Select cache by audio path or audio SHA-256, not both.")
     result = inspect_artifacts(
         artifacts_dir(config_dir),
         vault_scope_hash(root),
-        audio_sha256=_optional_audio_hash(audio),
+        audio_sha256=_optional_audio_hash(audio) if audio is not None else audio_sha256,
     )
     return {"status": "ok", "vault_root": str(root.resolve()), **result}
 
@@ -690,12 +696,15 @@ def transcription_cache_prune(
     *,
     config_dir: Path,
     audio: Optional[Path] = None,
+    audio_sha256: Optional[str] = None,
     apply: bool = False,
 ) -> dict[str, Any]:
+    if audio is not None and audio_sha256 is not None:
+        raise BootstrapError("Select cache by audio path or audio SHA-256, not both.")
     result = prune_artifacts(
         artifacts_dir(config_dir),
         vault_scope_hash(root),
-        audio_sha256=_optional_audio_hash(audio),
+        audio_sha256=_optional_audio_hash(audio) if audio is not None else audio_sha256,
         apply=apply,
     )
     return {"status": "pruned" if apply else "preview", "vault_root": str(root.resolve()), **result}

@@ -22,6 +22,10 @@ sys.path.insert(0, str(PROVIDERS))
 
 import qwen_mlx  # noqa: E402
 
+SCRIPTS = REPO_ROOT / "personal-context" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+import personal_context as pc  # noqa: E402
+
 
 class ArtifactStoreTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -116,6 +120,9 @@ class ArtifactStoreTests(unittest.TestCase):
         status = artifacts.inspect_artifacts(self.base, scope)
         self.assertEqual(status["recording_count"], 2)
         self.assertEqual(status["corrupt_artifacts"], 0)
+        self.assertIsNotNone(status["recordings"][0]["last_written_at"])
+        self.assertEqual(status["recordings"][0]["stage_details"]["asr"]["artifacts"], 1)
+        self.assertGreater(status["recordings"][0]["stage_details"]["asr"]["bytes"], 0)
         preview = artifacts.prune_artifacts(self.base, scope, audio_sha256="d" * 64, apply=False)
         self.assertTrue(preview["dry_run"])
         self.assertEqual([item["audio_sha256"] for item in preview["targets"]], ["d" * 64])
@@ -158,6 +165,106 @@ class ArtifactStoreTests(unittest.TestCase):
         self.assertEqual(preview.returncode, 0, preview.stderr)
         self.assertTrue(json.loads(preview.stdout)["dry_run"])
         self.assertTrue(store.recording_dir.is_dir())
+
+    def test_cache_status_maps_hash_to_source_and_prunes_by_source_id(self) -> None:
+        import artifacts
+
+        vault = Path(self.temp.name) / "mapped vault"
+        config = Path(self.temp.name) / "mapped config"
+        pc.init_vault(vault)
+        audio = Path(self.temp.name) / "命名录音.wav"
+        audio.write_bytes(b"synthetic named audio")
+        ingested = pc.ingest(vault, [audio], observed_at="2026-08-18T00:00:00Z", dry_run=False)
+        source_id = ingested["items"][0]["source_id"]
+        audio_hash = ingested["items"][0]["content_hash"]
+        scope = artifacts.vault_scope_hash(vault)
+        store = artifacts.ArtifactStore(config / "artifacts", scope, audio_hash)
+        key = artifacts.component_cache_key({"stage": "asr"})
+        with store.recording_lock():
+            store.write("asr", "chunk-00000", key, {"text": "只存在缓存，不输出正文"})
+
+        status = pc.transcription_cache_status(
+            vault, config_dir=config, audio=None, source_id=None, limit=10
+        )
+        recording = status["recordings"][0]
+        self.assertEqual(recording["source_status"], "linked")
+        self.assertEqual(recording["source_id"], source_id)
+        self.assertEqual(recording["original_name"], audio.name)
+        self.assertNotIn("只存在缓存", json.dumps(status, ensure_ascii=False))
+
+        script = REPO_ROOT / "personal-context" / "scripts" / "personal_context.py"
+        cli_status = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "transcription-cache-status",
+                "--root",
+                str(vault),
+                "--config-dir",
+                str(config),
+                "--source-id",
+                source_id,
+                "--limit",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(cli_status.returncode, 0, cli_status.stderr)
+        self.assertEqual(json.loads(cli_status.stdout)["recordings"][0]["original_name"], audio.name)
+
+        preview = pc.transcription_cache_prune(
+            vault,
+            config_dir=config,
+            audio=None,
+            source_id=source_id,
+            apply=False,
+        )
+        self.assertEqual(preview["targets"][0]["source_id"], source_id)
+        self.assertEqual(preview["targets"][0]["original_name"], audio.name)
+        self.assertTrue(store.recording_dir.is_dir())
+
+    def test_storage_status_reports_only_metadata_and_transient_residue(self) -> None:
+        vault = Path(self.temp.name) / "storage vault"
+        config = Path(self.temp.name) / "storage config"
+        pc.init_vault(vault)
+        audio = Path(self.temp.name) / "存储录音.wav"
+        audio.write_bytes(b"synthetic source bytes")
+        pc.ingest(vault, [audio], observed_at="2026-08-18T00:00:00Z", dry_run=False)
+        (vault / "inbox" / "存储录音-录音转写.md").write_text("合成逐字稿", encoding="utf-8")
+        stale = config / "capture-jobs" / "capture-audio-stale"
+        stale.mkdir(parents=True)
+        (stale / "transcript.v1.json").write_text("sensitive transient", encoding="utf-8")
+
+        status = pc.storage_status(vault, config_dir=config)
+
+        self.assertEqual(status["source_blobs"]["recordings"], 1)
+        self.assertGreater(status["source_blobs"]["bytes"], 0)
+        self.assertEqual(status["inbox"]["files"], 1)
+        self.assertEqual(status["transient_jobs"]["jobs"], 1)
+        self.assertGreater(status["transient_jobs"]["bytes"], 0)
+        rendered = json.dumps(status, ensure_ascii=False)
+        self.assertNotIn("合成逐字稿", rendered)
+        self.assertNotIn("sensitive transient", rendered)
+
+        script = REPO_ROOT / "personal-context" / "scripts" / "personal_context.py"
+        cli_status = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "storage-status",
+                "--root",
+                str(vault),
+                "--config-dir",
+                str(config),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(cli_status.returncode, 0, cli_status.stderr)
+        self.assertEqual(json.loads(cli_status.stdout)["transient_jobs"]["jobs"], 1)
 
 
 class ProviderStageCacheTests(unittest.TestCase):

@@ -97,13 +97,17 @@ scripts/context transcribe-audio ... --refresh-stage alignment
 scripts/context transcribe-audio ... --refresh-stage diarization
 scripts/context transcribe-audio ... --refresh-stage all
 
-# Read metadata only, or preview/apply explicit deletion. Add --audio to select one recording.
+# Read metadata only, or preview/apply explicit deletion. Select by input path or Source ID.
 scripts/context transcription-cache-status --root <vault>
+scripts/context transcription-cache-status --root <vault> --limit 10
+scripts/context transcription-cache-status --root <vault> --source-id <source>
 scripts/context transcription-cache-prune --root <vault> --dry-run
+scripts/context transcription-cache-prune --root <vault> --source-id <source> --dry-run
 scripts/context transcription-cache-prune --root <vault> --apply
+scripts/context storage-status --root <vault>
 ```
 
-`--no-cache` and `--refresh-stage` are mutually exclusive. Status does not expose transcript payloads. Prune is never automatic and defaults to dry-run; `--apply` removes only recording directories in the selected Vault scope, or only the named audio hash when `--audio` is present.
+`--no-cache` and `--refresh-stage` are mutually exclusive. Cache status maps an artifact hash to an existing Source name when available and returns per-stage counts, bytes and last-write times. An unmatched cache is labelled `unbound`; no transcript payload is exposed. `--limit` sorts by last write, not last access. Prune is never automatic and defaults to dry-run; `--apply` removes only recording directories in the selected Vault scope, or the selected audio/Source entry. `storage-status` reports aggregate metadata for Source blobs, SQLite, Inbox, artifacts, private runtime, locks and recognizable transient-job directories without reading their contents.
 
 ## Limits and quality handling
 

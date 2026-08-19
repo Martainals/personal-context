@@ -39,6 +39,8 @@ scripts/context bootstrap-status --root <vault> --agent-host <host>
 
 `qwen-mlx` 仅在 macOS Apple Silicon 上提供本地高精度转写；其他环境使用 `transcript-only`，直到安装受支持的 Provider。详细模型、限制和输出协议见 `references/transcription.md`。
 
+只有用户明确提出“转写”“生成逐字稿”或同义请求时才运行录音流程。附件出现、用户只命名文件、询问方案或讨论录音内容都不构成转写授权；不要预先采集、转写或生成交付文件。
+
 ```bash
 # 用户要求录音转写时使用默认高层交付入口
 scripts/context capture-audio \
@@ -47,7 +49,9 @@ scripts/context capture-audio \
   --speaker-count 2
 ```
 
-`capture-audio` 在私有临时 job 中处理内部 `transcript.v1`，采集原音频 Source、原子导入证据，最后只向 `<vault>/inbox/` 发布 `<audio-stem>-录音转写.md`；正常成功后删除 job JSON。最终回复把该 Markdown 路径作为主要交付，不提供内部 JSON。在 `strict-local` 模式下，不读取、复述或打印转录正文。Provider 只负责转写，本流程不生成总结，不形成或批准长期 Memory。
+`capture-audio` 在私有临时 job 中处理内部 `transcript.v1`，采集原音频 Source、原子导入证据，最后只向 `<vault>/inbox/` 发布 `<audio-stem>-录音转写.md`；正常成功后删除 job JSON。Vault 在 `blobs/` 中保留一份不可变原音频，不处理或删除用户提供位置的原件。最终回复把该 Markdown 路径作为主要交付，不提供内部 JSON。在 `strict-local` 模式下，不读取、复述或打印转录正文。Provider 只负责转写，本流程不生成总结，不形成或批准长期 Memory。
+
+同一路径已有完整、未编辑且数据库证据匹配的交付时，默认返回现有 Markdown，不调用 Provider。只有用户明确要求重新转写时才加 `--rerun`；若标题、观察时间或重新生成的不可变 Segment 与既有 Event 不同则停止，避免静默建立第二个事件或覆盖证据。不要主动扫描其他文件名或目录寻找重复录音。
 
 `transcribe-audio --output <transcript.json>` 与手工 `ingest` / `import-transcript` 仅用于调试和第三方集成，不用于普通录音请求。完整发布顺序、失败恢复和人工编辑保护见 `references/capture.md`。
 
@@ -57,11 +61,14 @@ scripts/context capture-audio \
 
 ```bash
 scripts/context transcription-cache-status --root <vault> [--audio <audio>]
+scripts/context transcription-cache-status --root <vault> [--source-id <source>] [--limit <n>]
 scripts/context transcription-cache-prune --root <vault> [--audio <audio>] --dry-run
+scripts/context transcription-cache-prune --root <vault> [--source-id <source>] --dry-run
 scripts/context transcription-cache-prune --root <vault> [--audio <audio>] --apply
+scripts/context storage-status --root <vault>
 ```
 
-清理默认是预览；只有用户明确要求删除对应缓存时才使用 `--apply`。完整契约与失效规则见 `references/transcription.md`，敏感性和路径规则见 `references/privacy.md`。
+缓存状态按最近写入时间展示录音名、Source ID、阶段数量、大小和校验结果，不读取或打印缓存正文；“最近”不是访问历史。`storage-status` 只统计原音频、数据库、Inbox、缓存、运行环境和临时残留的元数据。清理默认是预览；只有用户明确要求删除对应缓存时才使用 `--apply`。完整契约与失效规则见 `references/transcription.md`，敏感性和路径规则见 `references/privacy.md`。
 
 ## 常规流程
 

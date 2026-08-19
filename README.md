@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="Skill version 0.5.0" src="https://img.shields.io/badge/skill-0.5.0-0f766e?style=flat-square">
+  <img alt="Skill version 0.5.1" src="https://img.shields.io/badge/skill-0.5.1-0f766e?style=flat-square">
   <img alt="Schema version 1" src="https://img.shields.io/badge/schema-1-b7791f?style=flat-square">
   <img alt="Agent Skills open format" src="https://img.shields.io/badge/format-Agent%20Skills-334155?style=flat-square">
   <img alt="Python 3.9 or newer" src="https://img.shields.io/badge/core-Python%203.9%2B-334155?style=flat-square">
@@ -125,7 +125,9 @@ CONTEXT_ROOT="/path/to/personal-context-vault"
 
 在 Apple Silicon 上，首次 `bootstrap-apply` 会在私有目录安装约 6.5 GB 模型与隔离运行环境，至少预留 10 GB 空间。许可计划也会明确说明默认启用的持久转写阶段缓存；只有接受 Notice 2 后才会生效。流程可恢复执行，不修改系统 Python，不启动后台服务。
 
-## 直接发送一段录音之后
+## 明确要求转写一段录音之后
+
+附件出现本身不会触发采集或转写。只有用户明确要求“转写”或“生成逐字稿”后，Agent 才应调用高层交付命令：
 
 Agent 应将录音落为一个明确的本地文件路径，再使用高层交付命令：
 
@@ -141,6 +143,10 @@ Agent 应将录音落为一个明确的本地文件路径，再使用高层交�
 命令会依次预检原音频、在私有 job 中生成并验证 `transcript.v1`、采集原音频 Source、原子导入证据，最后才把 `<audio-stem>-录音转写.md` 原子发布到 `inbox/`。成功后 job JSON 删除；Provider、渲染或导入失败时，inbox 不出现 JSON 或半成品。标准输出只含 ID、计数、Markdown 元数据及 Provider/cache 元数据，不打印正文。
 
 Markdown 包含标题、完整状态、总时长、人物标签与按 `HH:MM:SS` 排序的全部逐字稿。不可见完整性标记允许安全重跑；如果用户编辑过文件，系统拒绝覆盖并保留原件。
+
+同一路径已有完整、未编辑且数据库证据匹配的逐字稿时，默认直接返回现有 Markdown，不调用模型。只有明确要求重新转写时才使用 `--rerun`；标题、观察时间或人物/文字 Segment 变化会被 Schema 1 拒绝，以免静默建立第二个 Event 或覆盖不可变证据。接受修订后的逐字稿仍需要未来独立设计版本化流程。正常流程不会扫描其他目录或文件名寻找改名副本。
+
+Vault 会在 `blobs/` 中保留一份不可变原音频；系统不会删除或移动用户提供位置的原件。
 
 `--speaker-count` 是单次录音的可选提示；确定人数时应显式填写 1–4，不确定时省略并自动检测。已录完的文件默认使用高上下文 Sortformer 配置，再依据整段录音的置信度统一说话人通道、清除短暂跳变并组装发言轮次。
 
@@ -220,24 +226,27 @@ Vault 由用户选择，是唯一权威数据层：
 
 ```bash
 ./personal-context/scripts/context transcription-cache-status --root "$CONTEXT_ROOT"
+./personal-context/scripts/context transcription-cache-status --root "$CONTEXT_ROOT" --limit 10
+./personal-context/scripts/context transcription-cache-status --root "$CONTEXT_ROOT" --source-id '<source-id>'
 ./personal-context/scripts/context transcription-cache-prune --root "$CONTEXT_ROOT" --dry-run
 ./personal-context/scripts/context transcription-cache-prune --root "$CONTEXT_ROOT" --apply
+./personal-context/scripts/context storage-status --root "$CONTEXT_ROOT"
 ```
 
-三个命令都可加 `--audio /path/to/recording.m4a`，只检查或清理一条录音。产物使用 JSON/gzip 与 SHA-256 校验，不使用 pickle，不保存声纹或说话人 embedding。
+缓存状态会显示录音名、Source ID、阶段数量、大小、最近写入时间和完整性；没有 Source 的残留缓存会标记为 `unbound`，但不会返回正文。缓存命令可加 `--audio /path/to/recording.m4a` 或 `--source-id <id>` 选择一条录音。`storage-status` 汇总原音频、数据库、Inbox、缓存、运行环境和已知临时残留的元数据。产物使用 JSON/gzip 与 SHA-256 校验，不使用 pickle，不保存声纹或说话人 embedding。
 
 ## 版本与维护
 
 | 项目 | 当前值 |
 |---|---|
-| Skill | `0.5.0` |
+| Skill | `0.5.1` |
 | SQLite Schema | `1` |
 | Consent notice | `2` |
 | Provider contract | `1` |
 | Artifact contract | `1` |
 | qwen-mlx profile | `3` |
 
-0.5.0 只增加高层交付编排和 Markdown 派生文件，不改变 Schema、Provider/transcript contract、Artifact contract、Qwen profile 或 Notice，因此无需迁移数据库、重装模型或更新许可收据。
+0.5.1 增加明确触发、已有交付短路、可读缓存状态和空间状态，不改变 Schema、Provider/transcript contract、Artifact contract、Qwen profile 或 Notice，因此无需迁移数据库、重装模型或更新许可收据。
 
 项目根目录的 [`AGENTS.md`](./AGENTS.md) 是后续 Agent 开发和升级的唯一维护章程。`CLAUDE.md`、`GEMINI.md` 只引用它，避免多份规则漂移；Codex 的 `personal-context/agents/openai.yaml` 仅是可选界面元数据。
 
