@@ -20,6 +20,8 @@ Agent-neutral SKILL.md and JSON CLI
 
 The private configuration and runtime use the operating-system user configuration directory or explicit `--config-dir`. Model weights, consent receipts, caches, and transient capture jobs never live in the Git checkout or database.
 
+The default Qwen/MLX runtime and experimental 3D-Speaker/Torch runtime are separate sub-environments. The Qwen provider process owns normalization, ASR, alignment, artifact orchestration and transcript output; it invokes the experimental diarizer as a subprocess only when that explicit Provider is selected. That subprocess returns anonymous turns and scalar evidence over JSON stdout. It never returns or persists speaker embeddings or cluster centres.
+
 ## Vault layout
 
 ```text

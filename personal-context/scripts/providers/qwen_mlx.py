@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import subprocess
 import tempfile
 import wave
 from pathlib import Path
@@ -74,12 +75,22 @@ def model_path(models_dir: Path, repo_id: str) -> Path:
     return models_dir / repo_id.replace("/", "--")
 
 
-def download_models(manifest: dict[str, Any], models_dir: Path) -> dict[str, Any]:
+def download_models(
+    manifest: dict[str, Any],
+    models_dir: Path,
+    *,
+    model_roles: Optional[list[str]] = None,
+) -> dict[str, Any]:
     from huggingface_hub import snapshot_download
 
     models_dir.mkdir(parents=True, exist_ok=True)
+    selected_roles = model_roles or list(manifest["models"])
+    unknown = [role for role in selected_roles if role not in manifest["models"]]
+    if unknown:
+        raise RuntimeError("Unknown qwen-mlx model roles: " + ", ".join(unknown))
     downloaded = []
-    for role, model in manifest["models"].items():
+    for role in selected_roles:
+        model = manifest["models"][role]
         destination = model_path(models_dir, model["repo_id"])
         snapshot_download(
             repo_id=model["repo_id"],
@@ -449,6 +460,49 @@ def _collect_diarization(
     return derived["segments"], derived["details"]
 
 
+def _run_offline_diarization(
+    command: list[str], audio_path: Path, speaker_count: Optional[int]
+) -> dict[str, Any]:
+    invocation = [*command, "--audio", str(audio_path)]
+    if speaker_count is not None:
+        invocation.extend(["--speaker-count", str(speaker_count)])
+    result = subprocess.run(invocation, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "unknown error")[-6000:]
+        raise RuntimeError(f"Offline diarization failed: {details.strip()}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Offline diarization returned invalid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Offline diarization output must be a JSON object")
+    segments = payload.get("segments")
+    details = payload.get("details")
+    if not isinstance(segments, list) or not segments or not isinstance(details, dict):
+        raise RuntimeError("Offline diarization output is missing segments or details")
+    for item in segments:
+        if not isinstance(item, dict) or set(item) != {
+            "start",
+            "end",
+            "speaker",
+            "confidence",
+            "margin",
+        }:
+            raise RuntimeError("Offline diarization segment has an invalid shape")
+        start = float(item["start"])
+        end = float(item["end"])
+        confidence = float(item["confidence"])
+        margin = float(item["margin"])
+        if (
+            start < 0
+            or end <= start
+            or not 0.0 <= confidence <= 1.0
+            or not math.isfinite(margin)
+        ):
+            raise RuntimeError("Offline diarization segment has invalid scalar values")
+    return {"segments": segments, "details": details}
+
+
 # Preserve the provider's historical private names while keeping all word/turn
 # assembly behavior in the dependency-free transcript_assembly module.
 _speaker_details = speaker_details
@@ -507,6 +561,12 @@ def _model_identity(model: dict[str, Any]) -> dict[str, str]:
     return {"repo_id": str(model["repo_id"]), "revision": str(model["revision"])}
 
 
+def _runtime_packages_for(manifest: dict[str, Any], stage: str) -> list[str]:
+    configured = manifest.get("stage_runtime_packages") or {}
+    packages = configured.get(stage, manifest["runtime"]["packages"])
+    return [str(item) for item in packages]
+
+
 def _cached_payload(
     store: Optional[ArtifactStore],
     *,
@@ -517,17 +577,25 @@ def _cached_payload(
     compute: Callable[[], Any],
     cache_events: list[dict[str, str]],
 ) -> tuple[Any, str]:
+    lookup_status: Optional[str] = None
     if store is not None and not refresh:
         found = store.read(stage, name, cache_key)
-        cache_events.append({"stage": stage, "name": name, "status": found.status})
         if found.status == "hit":
+            cache_events.append({"stage": stage, "name": name, "status": "hit"})
             return found.payload, str(found.payload_sha256)
+        lookup_status = found.status
     payload = compute()
     if store is None:
         cache_events.append({"stage": stage, "name": name, "status": "disabled"})
         return payload, component_cache_key(payload)
     written = store.write(stage, name, cache_key, payload)
-    cache_events.append({"stage": stage, "name": name, "status": "refreshed" if refresh else "miss"})
+    cache_events.append(
+        {
+            "stage": stage,
+            "name": name,
+            "status": "refreshed" if refresh else str(lookup_status or "miss"),
+        }
+    )
     return payload, str(written.payload_sha256)
 
 
@@ -545,6 +613,11 @@ def transcribe(
     vault_scope: Optional[str] = None,
     no_cache: bool = False,
     refresh_stage: Optional[str] = None,
+    provider_name: Optional[str] = None,
+    diarization_backend: Optional[dict[str, Any]] = None,
+    offline_diarization_runner: Optional[
+        Callable[[Path, Optional[int]], dict[str, Any]]
+    ] = None,
 ) -> dict[str, Any]:
     if refresh_stage not in {None, "asr", "alignment", "diarization", "all"}:
         raise RuntimeError(f"Unknown refresh stage: {refresh_stage}")
@@ -552,6 +625,13 @@ def transcribe(
         raise RuntimeError("--no-cache cannot be combined with --refresh-stage")
     if not no_cache and (artifacts_dir is None or vault_scope is None):
         raise RuntimeError("Cached transcription requires artifacts_dir and vault_scope")
+    selected_provider = provider_name or str(manifest["provider"])
+    offline_backend = diarization_backend is not None
+    if offline_backend:
+        if diarization_backend.get("backend") != "3dspeaker-offline":
+            raise RuntimeError("Unsupported offline diarization backend")
+        if offline_diarization_runner is None:
+            raise RuntimeError("Offline diarization requires an isolated runner")
     samples, sample_rate = _to_mono_16k(audio_path)
     if len(samples) == 0:
         raise RuntimeError("Audio contains no samples")
@@ -561,6 +641,9 @@ def transcribe(
     if speaker_count is not None and not 1 <= speaker_count <= maximum_speakers:
         raise RuntimeError(f"speaker_count must be between 1 and {maximum_speakers}")
     artifact_config = _artifact_config(manifest)
+    word_assembly = dict(manifest["diarization"]["word_assembly"])
+    if offline_backend:
+        word_assembly.update(diarization_backend.get("word_assembly") or {})
     common_key = {
         "artifact_contract": artifact_config["contract_version"],
         "normalization_version": artifact_config["normalization_version"],
@@ -604,28 +687,84 @@ def transcribe(
         normalized_path = temporary_dir / "normalized.wav"
         _write_wav(normalized_path, samples, sample_rate)
         with lock:
-            raw_key = component_cache_key(
-                {
-                    **common_key,
-                    "component": "diarization",
-                    "component_version": artifact_config["stage_versions"]["diarization"],
-                    "model": _model_identity(models["diarizer"]),
-                    "runtime_packages": manifest["runtime"]["packages"],
-                    "streaming": manifest["diarization"]["streaming"],
-                    "inference": manifest["diarization"].get("inference", {}),
-                }
-            )
-            raw_diarization, raw_sha = _cached_payload(
-                store,
-                stage="diarization",
-                name="raw-probabilities",
-                cache_key=raw_key,
-                refresh=refresh_stage in {"diarization", "all"},
-                compute=lambda: _collect_raw_diarization(
-                    ensure_diarization_model(), normalized_path, manifest["diarization"]
-                ),
-                cache_events=cache_events,
-            )
+            if offline_backend:
+                offline_key = component_cache_key(
+                    {
+                        **common_key,
+                        "component": "offline-diarization",
+                        "component_version": int(
+                            (diarization_backend.get("diarization") or {}).get(
+                                "stage_version", 1
+                            )
+                        ),
+                        "backend": diarization_backend["backend"],
+                        "profile_version": diarization_backend.get("profile_version"),
+                        "source": diarization_backend.get("source"),
+                        "models": diarization_backend.get("models"),
+                        "runtime_packages": (diarization_backend.get("runtime") or {}).get(
+                            "packages", []
+                        ),
+                        "settings": diarization_backend.get("diarization"),
+                        "speaker_count": speaker_count,
+                    }
+                )
+                speaker_turns, speaker_turns_sha = _cached_payload(
+                    store,
+                    stage="diarization",
+                    name="offline-turns",
+                    cache_key=offline_key,
+                    refresh=refresh_stage in {"diarization", "all"},
+                    compute=lambda: offline_diarization_runner(
+                        normalized_path, speaker_count
+                    ),
+                    cache_events=cache_events,
+                )
+            else:
+                raw_key = component_cache_key(
+                    {
+                        **common_key,
+                        "component": "diarization",
+                        "component_version": artifact_config["stage_versions"]["diarization"],
+                        "model": _model_identity(models["diarizer"]),
+                        "runtime_packages": _runtime_packages_for(manifest, "diarization"),
+                        "streaming": manifest["diarization"]["streaming"],
+                        "inference": manifest["diarization"].get("inference", {}),
+                    }
+                )
+                raw_diarization, raw_sha = _cached_payload(
+                    store,
+                    stage="diarization",
+                    name="raw-probabilities",
+                    cache_key=raw_key,
+                    refresh=refresh_stage in {"diarization", "all"},
+                    compute=lambda: _collect_raw_diarization(
+                        ensure_diarization_model(), normalized_path, manifest["diarization"]
+                    ),
+                    cache_events=cache_events,
+                )
+                speaker_turns_key = component_cache_key(
+                    {
+                        **common_key,
+                        "component": "speaker-turns",
+                        "component_version": artifact_config["stage_versions"]["speaker-turns"],
+                        "raw_diarization_sha256": raw_sha,
+                        "speaker_count": speaker_count,
+                        "postprocessing": manifest["diarization"]["postprocessing"],
+                    }
+                )
+                speaker_turns, speaker_turns_sha = _cached_payload(
+                    store,
+                    stage="speaker-turns",
+                    name="turns",
+                    cache_key=speaker_turns_key,
+                    refresh=refresh_stage in {"diarization", "all"},
+                    compute=lambda: _derive_speaker_turns(
+                        raw_diarization, manifest["diarization"], speaker_count
+                    ),
+                    cache_events=cache_events,
+                )
+            diarization = speaker_turns["segments"]
+            diarization_details = speaker_turns["details"]
 
             alignment_shas: list[str] = []
             punctuation_inputs: list[dict[str, Any]] = []
@@ -655,7 +794,7 @@ def transcribe(
                         "component": "asr",
                         "component_version": artifact_config["stage_versions"]["asr"],
                         "model": _model_identity(models["asr"]),
-                        "runtime_packages": manifest["runtime"]["packages"],
+                        "runtime_packages": _runtime_packages_for(manifest, "asr"),
                         "language": language,
                         "chunk": chunk_identity,
                     }
@@ -686,7 +825,7 @@ def transcribe(
                         "component": "alignment",
                         "component_version": artifact_config["stage_versions"]["alignment"],
                         "model": _model_identity(models["aligner"]),
-                        "runtime_packages": manifest["runtime"]["packages"],
+                        "runtime_packages": _runtime_packages_for(manifest, "alignment"),
                         "language": language,
                         "chunk": chunk_identity,
                         "asr_payload_sha256": asr_sha,
@@ -749,29 +888,6 @@ def transcribe(
                 if alignment_payload.get("fallback") is not None:
                     fallbacks.append(alignment_payload["fallback"])
 
-            speaker_turns_key = component_cache_key(
-                {
-                    **common_key,
-                    "component": "speaker-turns",
-                    "component_version": artifact_config["stage_versions"]["speaker-turns"],
-                    "raw_diarization_sha256": raw_sha,
-                    "speaker_count": speaker_count,
-                    "postprocessing": manifest["diarization"]["postprocessing"],
-                }
-            )
-            speaker_turns, speaker_turns_sha = _cached_payload(
-                store,
-                stage="speaker-turns",
-                name="turns",
-                cache_key=speaker_turns_key,
-                refresh=refresh_stage in {"diarization", "all"},
-                compute=lambda: _derive_speaker_turns(
-                    raw_diarization, manifest["diarization"], speaker_count
-                ),
-                cache_events=cache_events,
-            )
-            diarization = speaker_turns["segments"]
-            diarization_details = speaker_turns["details"]
             assembly_key = component_cache_key(
                 {
                     **common_key,
@@ -780,7 +896,7 @@ def transcribe(
                     "alignment_payload_sha256": alignment_shas,
                     "punctuation_restoration": punctuation_inputs,
                     "speaker_turns_sha256": speaker_turns_sha,
-                    "word_assembly": manifest["diarization"]["word_assembly"],
+                    "word_assembly": word_assembly,
                 }
             )
             assembly_payload, _ = _cached_payload(
@@ -794,7 +910,7 @@ def transcribe(
                         words,
                         fallbacks,
                         diarization,
-                        manifest["diarization"]["word_assembly"],
+                        word_assembly,
                     )
                 },
                 cache_events=cache_events,
@@ -818,14 +934,33 @@ def transcribe(
         "candidate_memories": [],
         "processing": {
             "contract": "transcript.v1",
-            "provider": manifest["provider"],
-            "profile_version": manifest["profile_version"],
+            "provider": selected_provider,
+            "profile_version": (
+                diarization_backend.get("profile_version")
+                if offline_backend
+                else manifest["profile_version"]
+            ),
             "source_audio_sha256": source_hash,
-            "runtime": manifest["runtime"],
-            "models": {
-                role: {"repo_id": model["repo_id"], "revision": model["revision"]}
-                for role, model in models.items()
-            },
+            "runtime": (
+                {
+                    "asr_alignment": manifest["runtime"],
+                    "diarization": diarization_backend.get("runtime"),
+                }
+                if offline_backend
+                else manifest["runtime"]
+            ),
+            "models": (
+                {
+                    "asr": _model_identity(models["asr"]),
+                    "aligner": _model_identity(models["aligner"]),
+                    "diarization": diarization_backend.get("models"),
+                }
+                if offline_backend
+                else {
+                    role: {"repo_id": model["repo_id"], "revision": model["revision"]}
+                    for role, model in models.items()
+                }
+            ),
             "language_hint": language,
             "maximum_speakers": maximum_speakers,
             "speaker_count_hint": speaker_count,
@@ -874,6 +1009,12 @@ def build_parser() -> argparse.ArgumentParser:
     command = subparsers.add_parser("download")
     command.add_argument("--manifest", required=True)
     command.add_argument("--models-dir", required=True)
+    command.add_argument(
+        "--model-role",
+        action="append",
+        choices=("asr", "aligner", "diarizer"),
+        dest="model_roles",
+    )
     command = subparsers.add_parser("transcribe")
     command.add_argument("--manifest", required=True)
     command.add_argument("--models-dir", required=True)
@@ -885,6 +1026,12 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--observed-at")
     command.add_argument("--artifacts-dir")
     command.add_argument("--vault-scope")
+    command.add_argument("--provider-name")
+    command.add_argument("--diarization-manifest")
+    command.add_argument("--offline-python")
+    command.add_argument("--offline-script")
+    command.add_argument("--offline-source-dir")
+    command.add_argument("--offline-models-dir")
     command.add_argument("--no-cache", action="store_true")
     command.add_argument(
         "--refresh-stage", choices=("asr", "alignment", "diarization", "all")
@@ -897,8 +1044,46 @@ def main() -> int:
     try:
         manifest = load_manifest(Path(args.manifest).resolve())
         if args.command == "download":
-            result = download_models(manifest, Path(args.models_dir).resolve())
+            result = download_models(
+                manifest,
+                Path(args.models_dir).resolve(),
+                model_roles=args.model_roles,
+            )
         else:
+            offline_manifest = None
+            offline_runner = None
+            if args.diarization_manifest:
+                required = {
+                    "offline_python": args.offline_python,
+                    "offline_script": args.offline_script,
+                    "offline_source_dir": args.offline_source_dir,
+                    "offline_models_dir": args.offline_models_dir,
+                }
+                missing = [name for name, value in required.items() if not value]
+                if missing:
+                    raise RuntimeError(
+                        "Offline diarization is missing arguments: " + ", ".join(missing)
+                    )
+                offline_manifest_path = Path(args.diarization_manifest).resolve()
+                offline_manifest = json.loads(
+                    offline_manifest_path.read_text(encoding="utf-8")
+                )
+                if not isinstance(offline_manifest, dict):
+                    raise RuntimeError("Offline diarization manifest must be a JSON object")
+                offline_command = [
+                    str(Path(args.offline_python).resolve()),
+                    str(Path(args.offline_script).resolve()),
+                    "diarize",
+                    "--manifest",
+                    str(offline_manifest_path),
+                    "--source-dir",
+                    str(Path(args.offline_source_dir).resolve()),
+                    "--models-dir",
+                    str(Path(args.offline_models_dir).resolve()),
+                ]
+                offline_runner = lambda audio, count: _run_offline_diarization(
+                    offline_command, audio, count
+                )
             result = transcribe(
                 manifest,
                 Path(args.models_dir).resolve(),
@@ -912,6 +1097,9 @@ def main() -> int:
                 vault_scope=args.vault_scope,
                 no_cache=args.no_cache,
                 refresh_stage=args.refresh_stage,
+                provider_name=args.provider_name,
+                diarization_backend=offline_manifest,
+                offline_diarization_runner=offline_runner,
             )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0

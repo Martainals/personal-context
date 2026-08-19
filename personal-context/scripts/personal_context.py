@@ -1910,6 +1910,8 @@ def version_info(root: Optional[Path]) -> dict[str, Any]:
         "provider_contract_version": 1,
         "artifact_contract_version": 1,
         "consent_notice_version": 2,
+        "qwen_mlx_profile_version": 3,
+        "qwen_mlx_3dspeaker_profile_version": 1,
     }
     if root is not None:
         result["database"] = schema_state(root)
@@ -1930,7 +1932,11 @@ def _add_bootstrap_options(
 ) -> None:
     parser.add_argument("--config-dir", help="Private machine configuration; defaults to the operating-system user config directory.")
     if include_provider:
-        parser.add_argument("--provider", choices=("auto", "transcript-only", "qwen-mlx"), default="auto")
+        parser.add_argument(
+            "--provider",
+            choices=("auto", "transcript-only", "qwen-mlx", "qwen-mlx-3dspeaker"),
+            default="auto",
+        )
     parser.add_argument("--agent-host", required=require_agent_host, help="Stable host name such as codex, claude-code, or gemini-cli.")
 
 

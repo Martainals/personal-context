@@ -30,6 +30,18 @@
       "license": "NVIDIA Open Model License"
     }
   },
+  "install_profiles": {
+    "full": {
+      "model_roles": ["asr", "aligner", "diarizer"],
+      "download_estimate_gb": 6.5,
+      "minimum_free_disk_gb": 10
+    },
+    "asr_alignment": {
+      "model_roles": ["asr", "aligner"],
+      "download_estimate_gb": 6.0,
+      "minimum_free_disk_gb": 10
+    }
+  },
   "artifacts": {
     "contract_version": 1,
     "format": "json+gzip",

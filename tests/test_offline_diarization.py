@@ -1,0 +1,637 @@
+from __future__ import annotations
+
+import copy
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PROVIDERS = REPO_ROOT / "personal-context" / "scripts" / "providers"
+sys.path.insert(0, str(PROVIDERS))
+SCRIPTS = REPO_ROOT / "personal-context" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+import diarization_3dspeaker  # noqa: E402
+import personal_context_bootstrap as onboarding  # noqa: E402
+import qwen_mlx  # noqa: E402
+import transcript_assembly  # noqa: E402
+
+
+class DiarizationEvidenceTests(unittest.TestCase):
+    def test_cluster_evidence_exposes_only_anonymous_scalar_scores(self) -> None:
+        chunks = [[0.0, 1.5], [0.75, 2.25], [2.25, 3.75], [3.0, 4.5]]
+        labels = [0, 0, 1, 1]
+        embeddings = [
+            [1.0, 0.0],
+            [0.98, 0.02],
+            [-1.0, 0.0],
+            [-0.98, -0.02],
+        ]
+
+        segments = diarization_3dspeaker.anonymous_segments_with_evidence(
+            chunks, labels, embeddings
+        )
+
+        self.assertEqual([item["speaker"] for item in segments], [0, 1])
+        self.assertTrue(all(0.0 <= item["confidence"] <= 1.0 for item in segments))
+        self.assertTrue(all(item["margin"] > 0.9 for item in segments))
+        encoded = json.dumps(segments, ensure_ascii=False).casefold()
+        self.assertNotIn("embedding", encoded)
+        self.assertNotIn("centroid", encoded)
+        self.assertEqual(
+            set(segments[0]), {"start", "end", "speaker", "confidence", "margin"}
+        )
+
+    def test_auto_clustering_handles_fewer_chunks_than_the_speaker_limit(self) -> None:
+        count = diarization_3dspeaker._speaker_count_from_eigenvalues(
+            [0.0, 0.8], 1, 4
+        )
+
+        self.assertEqual(count, 1)
+
+    def test_offline_profile_can_disable_broad_boundary_snapping(self) -> None:
+        words = [
+            {"start": 0.0, "end": 0.6, "text": "不能再熬"},
+            {"start": 0.6, "end": 0.7, "text": "夜"},
+            {"start": 0.7, "end": 0.8, "text": "了"},
+            {"start": 1.1, "end": 1.2, "text": "我"},
+        ]
+        diarization = [
+            {"start": 0.0, "end": 0.6, "speaker": 0, "confidence": 0.9, "margin": 0.8},
+            {"start": 0.6, "end": 1.2, "speaker": 1, "confidence": 0.9, "margin": 0.8},
+        ]
+        settings = {
+            "boundary_realign_enabled": False,
+            "max_fragment_characters": 0,
+            "max_fragment_seconds": 0.0,
+            "max_fragment_gap_seconds": 0.0,
+            "max_fragment_margin": 0.0,
+            "max_same_speaker_gap_seconds": 1.2,
+            "max_segment_characters": 280,
+            "sentence_pause_seconds": 0.2,
+        }
+
+        segments = transcript_assembly.merge_words(words, diarization, settings)
+
+        self.assertEqual(
+            [(item["speaker"], item["text"]) for item in segments],
+            [("S01", "不能再熬"), ("S02", "夜了"), ("S02", "我")],
+        )
+
+
+class OfflineBackendCacheTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="personal-context-offline-diar-")
+        self.base = Path(self.temp.name)
+        self.audio = self.base / "synthetic.wav"
+        self.audio.write_bytes(b"synthetic-audio-evidence")
+        self.artifacts = self.base / "artifacts"
+        self.models = self.base / "models"
+        self.models.mkdir()
+        self.scope = "a" * 64
+        self.manifest = json.loads(
+            (
+                REPO_ROOT
+                / "personal-context"
+                / "assets"
+                / "providers"
+                / "qwen-mlx.lock.json"
+            ).read_text(encoding="utf-8")
+        )
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    @staticmethod
+    def _offline_profile(package: str) -> dict[str, object]:
+        return {
+            "provider": "qwen-mlx-3dspeaker",
+            "profile_version": 1,
+            "backend": "3dspeaker-offline",
+            "source": {
+                "repo": "https://github.com/modelscope/3D-Speaker.git",
+                "revision": "065629c313eaf1a01c65c640c46d77e61e9607b4",
+            },
+            "runtime": {"packages": [package]},
+            "models": {
+                "embedding": {
+                    "repo_id": "iic/speech_campplus_sv_zh_en_16k-common_advanced",
+                    "revision": "v1.0.0",
+                },
+                "vad": {
+                    "repo_id": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+                    "revision": "v2.0.4",
+                },
+            },
+            "diarization": {"stage_version": 1, "mode": "offline_clustering"},
+        }
+
+    def test_changing_only_diarizer_runtime_reuses_asr_and_alignment(self) -> None:
+        counters = {"asr": 0, "alignment": 0, "offline": 0, "sortformer": 0}
+
+        class AsrModel:
+            def generate(self, path: str, language: str | None = None) -> object:
+                del path, language
+                counters["asr"] += 1
+                return types.SimpleNamespace(text="你好，世界。")
+
+        class AlignmentModel:
+            def generate(
+                self, path: str, text: str, language: str | None = None
+            ) -> object:
+                del path, text, language
+                counters["alignment"] += 1
+                return [
+                    types.SimpleNamespace(text="你好", start_time=0.0, end_time=0.4),
+                    types.SimpleNamespace(text="世界", start_time=0.4, end_time=0.8),
+                ]
+
+        def load_stt(_: Path, model: dict[str, object]) -> object:
+            if "ForcedAligner" in str(model["repo_id"]):
+                return AlignmentModel()
+            return AsrModel()
+
+        def offline_runner(audio: Path, speaker_count: int | None) -> dict[str, object]:
+            del audio
+            counters["offline"] += 1
+            self.assertEqual(speaker_count, 2)
+            return {
+                "segments": [
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "speaker": 0,
+                        "confidence": 0.93,
+                        "margin": 0.71,
+                    }
+                ],
+                "details": {
+                    "backend": "3dspeaker-offline",
+                    "evidence": "cluster-distance",
+                    "expected_speakers": 2,
+                },
+            }
+
+        def fake_audio(_: Path) -> tuple[list[float], int]:
+            return [0.1] * 16000, 16000
+
+        def fake_wav(path: Path, samples: object, sample_rate: int = 16000) -> None:
+            del samples, sample_rate
+            path.write_bytes(b"normalized")
+
+        with mock.patch.object(qwen_mlx, "_to_mono_16k", side_effect=fake_audio), mock.patch.object(
+            qwen_mlx, "_write_wav", side_effect=fake_wav
+        ), mock.patch.object(qwen_mlx, "_load_stt_model", side_effect=load_stt), mock.patch.object(
+            qwen_mlx,
+            "_load_vad_model",
+            side_effect=lambda *_: counters.__setitem__("sortformer", counters["sortformer"] + 1),
+        ):
+            first = qwen_mlx.transcribe(
+                copy.deepcopy(self.manifest),
+                self.models,
+                self.audio,
+                self.base / "first.json",
+                language="Chinese",
+                title="合成",
+                observed_at="2026-08-19T00:00:00Z",
+                speaker_count=2,
+                artifacts_dir=self.artifacts,
+                vault_scope=self.scope,
+                provider_name="qwen-mlx-3dspeaker",
+                diarization_backend=self._offline_profile("torch==2.8.0"),
+                offline_diarization_runner=offline_runner,
+            )
+            first_counts = dict(counters)
+            second = qwen_mlx.transcribe(
+                copy.deepcopy(self.manifest),
+                self.models,
+                self.audio,
+                self.base / "second.json",
+                language="Chinese",
+                title="合成",
+                observed_at="2026-08-19T00:00:00Z",
+                speaker_count=2,
+                artifacts_dir=self.artifacts,
+                vault_scope=self.scope,
+                provider_name="qwen-mlx-3dspeaker",
+                diarization_backend=self._offline_profile("torch==2.8.1"),
+                offline_diarization_runner=offline_runner,
+            )
+
+        self.assertEqual(first_counts, {"asr": 1, "alignment": 1, "offline": 1, "sortformer": 0})
+        self.assertEqual(counters, {"asr": 1, "alignment": 1, "offline": 2, "sortformer": 0})
+        self.assertEqual(len(first["cache"]["events"]), 4)
+        self.assertEqual(first["cache"]["computed"], 4)
+        self.assertEqual(len(second["cache"]["events"]), 4)
+        self.assertEqual(second["cache"]["hits"], 3)
+        self.assertEqual(second["cache"]["computed"], 1)
+        self.assertEqual(first["cache"]["enabled"], True)
+        self.assertEqual(second["cache"]["enabled"], True)
+        self.assertEqual(
+            json.loads((self.base / "second.json").read_text(encoding="utf-8"))["processing"]["provider"],
+            "qwen-mlx-3dspeaker",
+        )
+        self.assertTrue(
+            (
+                self.artifacts
+                / self.scope
+                / qwen_mlx.digest_file(self.audio)
+                / "diarization"
+                / "offline-turns.json.gz"
+            ).is_file()
+        )
+
+
+class ExperimentalProviderPlanTests(unittest.TestCase):
+    def test_experimental_provider_is_explicit_and_auto_default_does_not_change(self) -> None:
+        self.assertEqual(onboarding.select_provider("auto"), "qwen-mlx")
+        self.assertEqual(
+            onboarding.select_provider("qwen-mlx-3dspeaker"),
+            "qwen-mlx-3dspeaker",
+        )
+        manifest = onboarding.load_manifest("qwen-mlx-3dspeaker")
+        self.assertEqual(manifest["backend"], "3dspeaker-offline")
+        self.assertTrue(manifest["experimental"])
+        self.assertNotEqual(
+            onboarding.provider_profile_digest("qwen-mlx"),
+            onboarding.provider_profile_digest("qwen-mlx-3dspeaker"),
+        )
+        self.assertEqual(
+            onboarding.manifest_digest(onboarding.load_manifest("qwen-mlx")),
+            "59c246c139563a578339f0bd9fdde16f71c35b1a570ddf0b18ec7d56a65db750",
+        )
+
+    def test_bootstrap_plan_discloses_separate_runtime_and_in_memory_voice_features(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="personal-context-provider-plan-") as temporary:
+            base = Path(temporary)
+            root = base / "vault"
+            config = base / "config"
+            with mock.patch.object(
+                onboarding,
+                "provider_status",
+                return_value={
+                    "provider": "qwen-mlx-3dspeaker",
+                    "compatible": True,
+                    "installed": False,
+                    "ready": False,
+                    "base_runtime_ready": True,
+                    "diarization_runtime_ready": False,
+                },
+            ):
+                plan = onboarding.bootstrap_plan(
+                    root,
+                    config_dir=config,
+                    mode="strict-local",
+                    provider="qwen-mlx-3dspeaker",
+                    agent_host="codex",
+                    database_state={"status": "missing"},
+                )
+
+        actions = [item["action"] for item in plan["steps"]]
+        self.assertIn("install-private-diarization-runtime", actions)
+        self.assertNotIn("install-private-runtime", actions)
+        self.assertTrue(plan["provider_profile"]["experimental"])
+        self.assertTrue(
+            plan["provider_profile"]["privacy"]["embeddings_in_memory_only"]
+        )
+        diarizer_step = next(
+            item
+            for item in plan["steps"]
+            if item["action"] == "install-private-diarization-runtime"
+        )
+        self.assertEqual(diarizer_step["system_requirements"], ["git"])
+
+    def test_fresh_open_source_install_plan_includes_both_private_runtimes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="personal-context-fresh-install-") as temporary:
+            base = Path(temporary)
+            root = base / "vault"
+            config = base / "config"
+            with mock.patch.object(
+                onboarding,
+                "provider_status",
+                return_value={
+                    "provider": "qwen-mlx-3dspeaker",
+                    "compatible": True,
+                    "installed": False,
+                    "ready": False,
+                    "base_runtime_ready": False,
+                    "diarization_runtime_ready": False,
+                },
+            ):
+                plan = onboarding.bootstrap_plan(
+                    root,
+                    config_dir=config,
+                    mode="strict-local",
+                    provider="qwen-mlx-3dspeaker",
+                    agent_host="portable-agent",
+                    database_state={"status": "missing"},
+                )
+
+        actions = [item["action"] for item in plan["steps"]]
+        self.assertLess(
+            actions.index("install-private-runtime"),
+            actions.index("install-private-diarization-runtime"),
+        )
+        base_manifest = onboarding.load_manifest("qwen-mlx")
+        diarizer_manifest = onboarding.load_manifest("qwen-mlx-3dspeaker")
+        base_step = next(
+            item for item in plan["steps"] if item["action"] == "install-private-runtime"
+        )
+        self.assertEqual(
+            {item["role"] for item in base_step["models"]}, {"asr", "aligner"}
+        )
+        self.assertNotIn(
+            "diarizer", {item["role"] for item in base_step["models"]}
+        )
+        self.assertEqual(
+            plan["installation"]["download_estimate_gb"],
+            base_manifest["install_profiles"]["asr_alignment"][
+                "download_estimate_gb"
+            ]
+            + diarizer_manifest["limits"]["download_estimate_gb"],
+        )
+        self.assertEqual(
+            plan["installation"]["minimum_free_disk_gb"],
+            base_manifest["install_profiles"]["asr_alignment"][
+                "minimum_free_disk_gb"
+            ]
+            + diarizer_manifest["limits"]["minimum_free_disk_gb"],
+        )
+        self.assertEqual(plan["installation"]["resume_action"], "rerun-bootstrap-apply")
+        self.assertFalse(root.exists())
+        self.assertFalse(config.exists())
+
+    def test_incomplete_private_runtime_reports_missing_components(self) -> None:
+        compatible = {
+            "system": "Darwin",
+            "machine": "arm64",
+            "python": "3.9.0",
+            "qwen_mlx_compatible": True,
+            "qwen_mlx_reason": None,
+        }
+        with tempfile.TemporaryDirectory(prefix="personal-context-runtime-status-") as temporary:
+            with mock.patch.object(onboarding, "platform_probe", return_value=compatible):
+                status = onboarding._offline_diarization_status(Path(temporary))
+
+        self.assertFalse(status["ready"])
+        self.assertEqual(
+            set(status["missing_components"]),
+            {"python", "source", "embedding_model", "vad_model", "runtime_marker"},
+        )
+
+    def test_experimental_provider_reports_missing_git_before_source_install(self) -> None:
+        no_git = {
+            "system": "Darwin",
+            "machine": "arm64",
+            "python": "3.9.0",
+            "qwen_mlx_compatible": True,
+            "qwen_mlx_reason": None,
+            "git_available": False,
+            "git_path": None,
+        }
+        with tempfile.TemporaryDirectory(prefix="personal-context-no-git-") as temporary:
+            with mock.patch.object(onboarding, "platform_probe", return_value=no_git):
+                status = onboarding._offline_diarization_status(Path(temporary))
+
+        self.assertFalse(status["compatible"])
+        self.assertIn("git", status["reason"].lower())
+
+    def test_bootstrap_apply_never_reports_ready_after_incomplete_install(self) -> None:
+        compatible = {
+            "system": "Darwin",
+            "machine": "arm64",
+            "python": "3.9.0",
+            "qwen_mlx_compatible": True,
+            "qwen_mlx_reason": None,
+        }
+        incomplete = {
+            "provider": "qwen-mlx-3dspeaker",
+            "compatible": True,
+            "installed": False,
+            "ready": False,
+            "base_runtime_ready": True,
+            "diarization_runtime_ready": False,
+            "missing_components": ["diarization:runtime_marker"],
+        }
+        with tempfile.TemporaryDirectory(prefix="personal-context-apply-verify-") as temporary:
+            base = Path(temporary)
+            root = base / "vault"
+            config = base / "config"
+            with mock.patch.object(onboarding, "platform_probe", return_value=compatible):
+                plan_digest = onboarding.consent_scope_digest(
+                    root,
+                    provider="qwen-mlx-3dspeaker",
+                    mode="strict-local",
+                    agent_host="portable-agent",
+                )
+                onboarding.record_consent(
+                    root,
+                    config_dir=config,
+                    mode="strict-local",
+                    provider="qwen-mlx-3dspeaker",
+                    agent_host="portable-agent",
+                    accepted_digest=plan_digest,
+                )
+            install_base = mock.Mock()
+            install_diarizer = mock.Mock()
+            with mock.patch.object(
+                onboarding, "provider_status", side_effect=[incomplete, incomplete]
+            ):
+                with self.assertRaises(onboarding.BootstrapError):
+                    onboarding.bootstrap_apply(
+                        root,
+                        config_dir=config,
+                        provider="qwen-mlx-3dspeaker",
+                        agent_host="portable-agent",
+                        database_state={"status": "current", "version": 1},
+                        init_vault=mock.Mock(),
+                        install_runtime=install_base,
+                        install_diarization_runtime=install_diarizer,
+                    )
+
+        install_base.assert_not_called()
+        install_diarizer.assert_called_once_with(config)
+
+    def test_fresh_apply_installs_in_order_and_ready_rerun_installs_nothing(self) -> None:
+        compatible = {
+            "system": "Darwin",
+            "machine": "arm64",
+            "python": "3.9.0",
+            "qwen_mlx_compatible": True,
+            "qwen_mlx_reason": None,
+        }
+        incomplete = {
+            "provider": "qwen-mlx-3dspeaker",
+            "compatible": True,
+            "installed": False,
+            "ready": False,
+            "base_runtime_ready": False,
+            "diarization_runtime_ready": False,
+            "missing_components": ["base:python", "diarization:python"],
+        }
+        ready = {
+            "provider": "qwen-mlx-3dspeaker",
+            "compatible": True,
+            "installed": True,
+            "ready": True,
+            "base_runtime_ready": True,
+            "diarization_runtime_ready": True,
+            "missing_components": [],
+        }
+        with tempfile.TemporaryDirectory(prefix="personal-context-apply-order-") as temporary:
+            base = Path(temporary)
+            root = base / "vault"
+            config = base / "config"
+            with mock.patch.object(onboarding, "platform_probe", return_value=compatible):
+                onboarding.record_consent(
+                    root,
+                    config_dir=config,
+                    mode="strict-local",
+                    provider="qwen-mlx-3dspeaker",
+                    agent_host="portable-agent",
+                    accepted_digest=onboarding.consent_scope_digest(
+                        root,
+                        provider="qwen-mlx-3dspeaker",
+                        mode="strict-local",
+                        agent_host="portable-agent",
+                    ),
+                )
+            order: list[str] = []
+            with mock.patch.object(
+                onboarding, "provider_status", side_effect=[incomplete, ready]
+            ):
+                result = onboarding.bootstrap_apply(
+                    root,
+                    config_dir=config,
+                    provider="qwen-mlx-3dspeaker",
+                    agent_host="portable-agent",
+                    database_state={"status": "current", "version": 1},
+                    init_vault=mock.Mock(),
+                    install_asr_alignment_runtime=lambda _: order.append("base"),
+                    install_diarization_runtime=lambda _: order.append("diarization"),
+                )
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(order, ["base", "diarization"])
+
+            install_base = mock.Mock()
+            install_diarizer = mock.Mock()
+            with mock.patch.object(onboarding, "provider_status", return_value=ready):
+                repeated = onboarding.bootstrap_apply(
+                    root,
+                    config_dir=config,
+                    provider="qwen-mlx-3dspeaker",
+                    agent_host="portable-agent",
+                    database_state={"status": "current", "version": 1},
+                    init_vault=mock.Mock(),
+                    install_runtime=install_base,
+                    install_asr_alignment_runtime=install_base,
+                    install_diarization_runtime=install_diarizer,
+                )
+            self.assertEqual(repeated["status"], "ready")
+            install_base.assert_not_called()
+            install_diarizer.assert_not_called()
+
+    def test_private_installer_uses_pinned_source_and_model_download_contract(self) -> None:
+        compatible = {
+            "system": "Darwin",
+            "machine": "arm64",
+            "python": "3.9.0",
+            "qwen_mlx_compatible": True,
+            "qwen_mlx_reason": None,
+        }
+        manifest = onboarding.load_manifest("qwen-mlx-3dspeaker")
+        with tempfile.TemporaryDirectory(prefix="personal-context-installer-") as temporary:
+            config = Path(temporary) / "config"
+            runtime = onboarding.diarization_runtime_dir(config)
+            uv_path = onboarding._venv_uv(runtime / "bootstrap")
+            python_path = onboarding._venv_python(runtime / "venv")
+            uv_path.parent.mkdir(parents=True)
+            uv_path.write_text("synthetic uv", encoding="utf-8")
+            python_path.parent.mkdir(parents=True)
+            python_path.write_text("synthetic python", encoding="utf-8")
+            commands: list[list[str]] = []
+
+            def fake_run(
+                command: list[str], *, env: dict[str, str] | None = None
+            ) -> object:
+                del env
+                commands.append(command)
+                if command[:3] == ["git", "clone", "--no-checkout"]:
+                    checkout = Path(command[-1])
+                    (checkout / ".git").mkdir(parents=True)
+                    (checkout / "speakerlab").mkdir()
+                if len(command) > 2 and command[1].endswith(
+                    "diarization_3dspeaker.py"
+                ) and command[2] == "download":
+                    models = Path(command[command.index("--models-dir") + 1])
+                    embedding = models / "embedding"
+                    vad = models / "vad"
+                    embedding.mkdir(parents=True)
+                    vad.mkdir()
+                    (models / "model-paths.json").write_text(
+                        json.dumps(
+                            {"embedding": str(embedding), "vad": str(vad)}
+                        ),
+                        encoding="utf-8",
+                    )
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(
+                onboarding, "platform_probe", return_value=compatible
+            ), mock.patch.object(
+                onboarding.shutil, "which", return_value="/usr/bin/git"
+            ), mock.patch.object(onboarding, "_run_checked", side_effect=fake_run):
+                status = onboarding.install_3dspeaker_runtime(config)
+
+        self.assertTrue(status["ready"])
+        clone = next(command for command in commands if command[:2] == ["git", "clone"])
+        self.assertEqual(clone[-2], manifest["source"]["repo"])
+        fetch = next(command for command in commands if "fetch" in command)
+        self.assertEqual(fetch[-1], manifest["source"]["revision"])
+        package_install = next(
+            command
+            for command in commands
+            if command[:3] == [str(uv_path), "pip", "install"]
+        )
+        for package in manifest["runtime"]["packages"]:
+            self.assertIn(package, package_install)
+        download = next(
+            command
+            for command in commands
+            if len(command) > 2 and command[2] == "download"
+        )
+        self.assertIn("--models-dir", download)
+
+    def test_qwen_downloader_can_install_only_asr_and_alignment_models(self) -> None:
+        manifest = onboarding.load_manifest("qwen-mlx")
+        calls: list[dict[str, str]] = []
+
+        def snapshot_download(**kwargs: str) -> None:
+            calls.append(kwargs)
+
+        fake_hub = types.SimpleNamespace(snapshot_download=snapshot_download)
+        with tempfile.TemporaryDirectory(prefix="personal-context-qwen-models-") as temporary:
+            with mock.patch.dict(sys.modules, {"huggingface_hub": fake_hub}):
+                result = qwen_mlx.download_models(
+                    manifest,
+                    Path(temporary),
+                    model_roles=["asr", "aligner"],
+                )
+
+        self.assertEqual([item["role"] for item in result["models"]], ["asr", "aligner"])
+        self.assertEqual(
+            {item["repo_id"] for item in calls},
+            {
+                manifest["models"]["asr"]["repo_id"],
+                manifest["models"]["aligner"]["repo_id"],
+            },
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

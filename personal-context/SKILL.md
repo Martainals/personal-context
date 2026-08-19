@@ -17,10 +17,10 @@ scripts/context bootstrap-status --root <vault> --agent-host <host>
 
 若状态不是 `ready`：
 
-1. 运行 `bootstrap-plan --root <vault> --agent-host <host> --mode <strict-local|agent-assisted>`。
-2. 向用户完整说明计划返回的本地写入、下载体积、模型许可、隐私模式、持久转写阶段缓存及其手动清理方式和限制。
-3. 仅在用户明确同意后，将绑定 Vault、模式、Provider、模型版本和 Agent host 的 `plan_digest` 传给 `record-consent --accept-plan <digest>`。
-4. 运行 `bootstrap-apply`。该命令只建立已获许可的 Vault 和隔离运行环境；不得改用云端补救失败。
+1. 运行 `bootstrap-plan --root <vault> --agent-host <host> --mode <strict-local|agent-assisted> --provider <auto|transcript-only|qwen-mlx|qwen-mlx-3dspeaker>`。默认 `auto` 只选择稳定 Provider；只有用户明确选择实验人物方案时才使用 `qwen-mlx-3dspeaker`。
+2. 向用户完整说明计划返回的本地写入、分环境和合计下载体积、保守磁盘需求、系统工具要求、模型许可、隐私模式、持久转写阶段缓存及其手动清理方式和限制。
+3. 仅在用户明确同意后，将相同 Provider 和绑定 Vault、模式、模型版本、Agent host 的 `plan_digest` 传给 `record-consent --accept-plan <digest>`。
+4. 使用相同 Provider 运行 `bootstrap-apply`。该命令只建立已获许可的 Vault 和隔离运行环境；不得改用云端补救失败。安装中断时重新运行 `bootstrap-status` 和 `bootstrap-apply`，只补齐未就绪的运行环境。
 5. 再运行 `bootstrap-status` 和 `doctor`，必须均正常后才采集真实资料。
 
 状态含义和逐项话术见 `references/onboarding.md`。兼容环境和回退规则见 `references/compatibility.md`。
@@ -37,7 +37,7 @@ scripts/context bootstrap-status --root <vault> --agent-host <host>
 
 ## 录音流程
 
-`qwen-mlx` 仅在 macOS Apple Silicon 上提供本地高精度转写；其他环境使用 `transcript-only`，直到安装受支持的 Provider。详细模型、限制和输出协议见 `references/transcription.md`。
+`qwen-mlx` 仅在 macOS Apple Silicon 上提供本地高精度转写；其他环境使用 `transcript-only`，直到安装受支持的 Provider。`qwen-mlx-3dspeaker` 是需要单独许可和安装的实验选项：它复用 Qwen ASR 与逐词对齐，只把人物分析换成整段离线聚类；`auto` 不会自动选择它。详细模型、限制和输出协议见 `references/transcription.md`。
 
 只有用户明确提出“转写”“生成逐字稿”或同义请求时才运行录音流程。附件出现、用户只命名文件、询问方案或讨论录音内容都不构成转写授权；不要预先采集、转写或生成交付文件。
 
@@ -68,7 +68,7 @@ scripts/context capture-audio \
 
 ASR 原文中的标点会在逐词对齐后按字符相似度安全贴回；相似度不足时宁可保留无标点结果，也不增删或猜测原词。最终组装在句末标点或至少 0.8 秒停顿处断段，避免把长段对话连成一整段。
 
-默认缓存 ASR 分块、逐词对齐分块、原始说话人概率、发言轮次和最终组装。首次启用必须持有 Notice 2 的有效许可。标题和观察时间不影响缓存；人数提示与后处理只重新派生说话人轮次。诊断时可用 `--no-cache` 完全绕过，或用 `--refresh-stage <asr|alignment|diarization|all>` 定向刷新。
+默认缓存 ASR 分块、逐词对齐分块、人物阶段和最终组装。`qwen-mlx` 的人物阶段保存录音内原始概率与发言轮次；实验 Provider 只保存匿名人物时间轴和非生物特征型的距离分数，人物 embedding 与聚类中心只允许存在于隔离子进程内存。首次启用必须持有 Notice 2 的有效许可，切换实验 Provider 需要接受绑定该 Provider 锁文件的新计划。标题和观察时间不影响缓存；刷新人物阶段不得让 ASR 或逐词对齐失效。诊断时可用 `--no-cache` 完全绕过，或用 `--refresh-stage <asr|alignment|diarization|all>` 定向刷新。
 
 ```bash
 scripts/context transcription-cache-status --root <vault> [--audio <audio>]

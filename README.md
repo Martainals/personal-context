@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="Skill version 0.6.0" src="https://img.shields.io/badge/skill-0.6.0-0f766e?style=flat-square">
+  <img alt="Skill version 0.7.0" src="https://img.shields.io/badge/skill-0.7.0-0f766e?style=flat-square">
   <img alt="Schema version 1" src="https://img.shields.io/badge/schema-1-b7791f?style=flat-square">
   <img alt="Agent Skills open format" src="https://img.shields.io/badge/format-Agent%20Skills-334155?style=flat-square">
   <img alt="Python 3.9 or newer" src="https://img.shields.io/badge/core-Python%203.9%2B-334155?style=flat-square">
@@ -19,7 +19,8 @@
 - 首次运行时生成机器可读的部署计划，向用户说明路径、下载、许可和隐私边界；
 - 用摘要锁定用户明确同意的范围，随后建立唯一 SQLite Vault；
 - 在 Apple Silicon 上部署隔离的 Qwen3-ASR BF16 本地转写环境；
-- 按 ASR、逐词对齐、原始说话人概率、发言轮次和最终组装分阶段缓存，重复或中断的录音只重算缺失部分；
+- 按 ASR、逐词对齐、人物分析和最终组装分阶段缓存，调整人物算法时不再重跑文字；
+- 提供显式、可回退的 3D-Speaker 离线人物实验选项，默认方案保持不变；
 - 把正常录音交付为 Vault `inbox` 中唯一、完整、可读且防误覆盖的 Markdown；
 - 将录音或文档变成不可变 Source、带时间的 Segment 与默认 Claim；
 - 审核 CandidateMemory 后才形成长期 Memory；
@@ -35,7 +36,7 @@
 | 原则 | 实现 |
 |---|---|
 | 首次许可不是一句提示词 | `status → plan → notice digest → receipt → apply` 确定性状态机 |
-| 本地转录没有静默云端降级 | `qwen-mlx` 失败就停止；不自动改用 API |
+| 本地转录没有静默云端降级 | 本地 Provider 失败就停止；不自动改用 API |
 | 模型环境不污染系统 | 私有 Python、虚拟环境、缓存和模型均位于用户配置目录 |
 | 转写中断不必从头开始 | 校验和保护的 JSON/gzip 阶段产物按录音和 Vault 隔离，损坏只重算对应分块 |
 | 内部 JSON 不污染 inbox | `transcript.v1` 只在私有临时 job 中连接 Provider 与数据库，成功或失败后均清理 |
@@ -52,11 +53,11 @@
 | 环境 | 数据库与转录导入 | 自动本地录音转写 |
 |---|---:|---:|
 | Codex / Claude Code / Gemini CLI，且可运行本地命令 | 完整 | 取决于电脑 |
-| macOS Apple Silicon | 完整 | `qwen-mlx` 高精度配置 |
+| macOS Apple Silicon | 完整 | 默认 `qwen-mlx`；可单独许可实验 `qwen-mlx-3dspeaker` |
 | Linux / Windows / 普通 CPU | 完整 | 本版使用 `transcript-only` |
 | 纯网页 Agent、无本地文件或进程权限 | 无法自动部署 | 无法自动部署 |
 
-`auto` 只会在 macOS Apple Silicon 选择 `qwen-mlx`，其他环境选择 `transcript-only`，永远不会自动选择云服务。
+`auto` 只会在 macOS Apple Silicon 选择 `qwen-mlx`，其他环境选择 `transcript-only`，永远不会自动选择云服务或实验人物方案。
 
 ## 安装 Skill
 
@@ -109,6 +110,12 @@ CONTEXT_ROOT="/path/to/personal-context-vault"
   --mode strict-local
 ```
 
+默认 `auto` 使用稳定 Provider。要在首次初始化时选择实验离线人物方案，请在状态、计划、许可和应用命令中都显式加上：
+
+```bash
+--provider qwen-mlx-3dspeaker
+```
+
 只有用户明确接受计划后，Agent 才能把返回的摘要写入许可记录：
 
 ```bash
@@ -116,14 +123,20 @@ CONTEXT_ROOT="/path/to/personal-context-vault"
   --root "$CONTEXT_ROOT" \
   --agent-host codex \
   --mode strict-local \
+  --provider auto \
   --accept-plan '<bootstrap-plan 返回的 plan_digest>'
 
 ./personal-context/scripts/context bootstrap-apply \
   --root "$CONTEXT_ROOT" \
-  --agent-host codex
+  --agent-host codex \
+  --provider auto
 ```
 
 在 Apple Silicon 上，首次 `bootstrap-apply` 会在私有目录安装约 6.5 GB 模型与隔离运行环境，至少预留 10 GB 空间。许可计划也会明确说明默认启用的持久转写阶段缓存；只有接受 Notice 2 后才会生效。流程可恢复执行，不修改系统 Python，不启动后台服务。
+
+实验 `qwen-mlx-3dspeaker` 必须从计划到应用始终显式指定同一 Provider。全新机器的计划会安装 Qwen ASR/逐词对齐（不会额外下载用不到的 Sortformer），再安装独立 3D-Speaker/Torch 环境：合计预计约 7.5 GB 下载，并保守要求约 14 GB 可用空间。已经安装当前 Qwen 环境的机器只会列出额外约 1.5 GB 下载和至少 4 GB 可用空间。计划包含固定的 Python 包、3D-Speaker 源码提交、`git` 系统要求和两个 ModelScope 模型；未接受该计划时不会安装。
+
+开源仓库只保存初始化脚本和精确锁文件，不保存虚拟环境、源码检出、模型、许可或转写缓存。所有大型文件都由 `bootstrap-apply` 安装到操作系统的用户私有配置目录。安装中断后先查看 `bootstrap-status` 返回的缺失组件，再重新运行 `bootstrap-apply`；已经完整的环境不会重复安装，任一组件仍不完整时也不会误报 `ready`。
 
 ## 明确要求转写一段录音之后
 
@@ -152,6 +165,8 @@ Vault 会在 `blobs/` 中保留一份不可变原音频；系统不会删除或�
 
 人数默认自动判断，不需要询问用户；只有用户主动明确人数时才传 `--speaker-count 1..4`。已录完的文件默认使用高上下文 Sortformer 配置，再依据整段录音的置信度统一说话人通道、清除短暂跳变并组装发言轮次。
 
+对长录音人物错分做诊断时，可以先生成 `--provider qwen-mlx-3dspeaker` 的许可计划。该实验方案复用原有 Qwen 文字与逐词时间戳，在独立 Torch 环境中整段聚类人物；人物模型或运行环境变化只让人物阶段与最终组装失效，不会重新计算 ASR 或对齐。它不会被 `auto` 选中，也不能在没有新计划和许可的情况下静默替换默认值。
+
 ASR 已识别出的标点会在逐词对齐后安全贴回；只有正文字符相似度达到 0.95 才执行，绝不补猜原词。最终逐字稿按句末标点或至少 0.8 秒停顿断段，改善长段无标点、难阅读和不利于后续归纳的问题。
 
 重复处理同一录音时默认复用私有阶段产物，并用稳定 ID 避免重复 Source、Event 和 Segment。标题、观察时间、人数提示和说话人后处理调整不会让 ASR 或逐词对齐失效；人数与后处理会从已缓存的原始说话人概率重新派生。
@@ -176,7 +191,7 @@ ASR 已识别出的标点会在逐词对齐后安全贴回；只有正文字符�
 
 ## 本地模型配置
 
-版本全部锁定在 [`qwen-mlx.lock.json`](./personal-context/assets/providers/qwen-mlx.lock.json)：
+默认模型全部锁定在 [`qwen-mlx.lock.json`](./personal-context/assets/providers/qwen-mlx.lock.json)：
 
 | 环节 | 模型 | 作用 |
 |---|---|---|
@@ -185,6 +200,8 @@ ASR 已识别出的标点会在逐词对齐后安全贴回；只有正文字符�
 | 多人分离 | Streaming Sortformer v2.1 fp32 | 高上下文推理、全局人数约束与最多四个录音内标签 |
 
 说话人标签只在单次录音中使用 `S01`–`S04`，不是声纹身份。五人以上、强噪声、重叠发言、超长录音或非英语多人会议可能降低分离质量。
+
+实验人物方案另由 [`3dspeaker-offline.lock.json`](./personal-context/assets/providers/3dspeaker-offline.lock.json) 锁定 3D-Speaker 源码、CAM++、VAD 与 Torch 依赖。人声向量和聚类中心只存在于隔离子进程内存；缓存只保存匿名人物时间轴和两个标量分数。当前关闭重叠说话扩展，也不建立“我的声音”或跨录音身份。
 
 ## 证据与记忆
 
@@ -237,20 +254,21 @@ Vault 由用户选择，是唯一权威数据层：
 ./personal-context/scripts/context storage-status --root "$CONTEXT_ROOT"
 ```
 
-缓存状态会显示录音名、Source ID、阶段数量、大小、最近写入时间和完整性；没有 Source 的残留缓存会标记为 `unbound`，但不会返回正文。缓存命令可加 `--audio /path/to/recording.m4a` 或 `--source-id <id>` 选择一条录音。`storage-status` 汇总原音频、数据库、Inbox、缓存、运行环境和已知临时残留的元数据。产物使用 JSON/gzip 与 SHA-256 校验，不使用 pickle，不保存声纹或说话人 embedding。
+缓存状态会显示录音名、Source ID、阶段数量、大小、最近写入时间和完整性；没有 Source 的残留缓存会标记为 `unbound`，但不会返回正文。缓存命令可加 `--audio /path/to/recording.m4a` 或 `--source-id <id>` 选择一条录音。`storage-status` 汇总原音频、数据库、Inbox、缓存、运行环境和已知临时残留的元数据。产物使用 JSON/gzip 与 SHA-256 校验，不使用 pickle，不保存声纹、说话人 embedding 或聚类中心。
 
 ## 版本与维护
 
 | 项目 | 当前值 |
 |---|---|
-| Skill | `0.6.0` |
+| Skill | `0.7.0` |
 | SQLite Schema | `1` |
 | Consent notice | `2` |
 | Provider contract | `1` |
 | Artifact contract | `1` |
 | qwen-mlx profile | `3` |
+| qwen-mlx-3dspeaker profile | `1`（实验） |
 
-0.6.0 增加 ASR 标点恢复、句子/停顿断段、默认自动人数判断和内容标题文件名。它不改变 Schema、Provider/transcript contract、Artifact contract、Qwen profile 或 Notice；旧的 ASR、逐词对齐和说话人缓存继续可用，无需迁移数据库、重装模型或更新许可收据。
+0.7.0 增加独立的 3D-Speaker 实验 Provider、人物距离分数和按阶段隔离的运行环境身份。默认 `qwen-mlx`、Schema、Provider/transcript contract、Artifact contract 与 Notice 都没有改变，所以现有默认 Provider 的数据库、模型和许可继续有效；只有主动选择实验 Provider 时才需要新计划、许可和额外安装。
 
 项目根目录的 [`AGENTS.md`](./AGENTS.md) 是后续 Agent 开发和升级的唯一维护章程。`CLAUDE.md`、`GEMINI.md` 只引用它，避免多份规则漂移；Codex 的 `personal-context/agents/openai.yaml` 仅是可选界面元数据。
 
@@ -282,6 +300,7 @@ PYTHONPYCACHEPREFIX=/tmp/personal-context-pycache \
 │   │   ├── transcript_markdown.py
 │   │   └── providers/
 │   │       ├── qwen_mlx.py
+│   │       ├── diarization_3dspeaker.py
 │   │       ├── artifacts.py
 │   │       └── transcript_assembly.py
 │   ├── assets/providers/         # 锁定包、模型和限制

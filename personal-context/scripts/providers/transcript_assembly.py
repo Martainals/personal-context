@@ -328,7 +328,8 @@ def merge_words(
                 "speaker_margin": margin,
             }
         )
-    labeled = realign_word_boundaries(labeled, settings)
+    if bool(settings.get("boundary_realign_enabled", True)):
+        labeled = realign_word_boundaries(labeled, settings)
     labeled = smooth_word_speakers(labeled, settings)
     merged: list[dict[str, Any]] = []
     sentence_pause = float(settings.get("sentence_pause_seconds", 0.8))

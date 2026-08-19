@@ -1,0 +1,69 @@
+{
+  "profile_version": 1,
+  "provider": "qwen-mlx-3dspeaker",
+  "base_provider": "qwen-mlx",
+  "backend": "3dspeaker-offline",
+  "display_name": "Qwen3-ASR with experimental offline 3D-Speaker diarization",
+  "platform": {
+    "system": "Darwin",
+    "machine": ["arm64", "aarch64"]
+  },
+  "source": {
+    "repo": "https://github.com/modelscope/3D-Speaker.git",
+    "revision": "065629c313eaf1a01c65c640c46d77e61e9607b4",
+    "license": "Apache-2.0"
+  },
+  "runtime": {
+    "python": "3.12",
+    "uv": "0.12.3",
+    "packages": [
+      "torch==2.8.0",
+      "torchaudio==2.8.0",
+      "modelscope[audio]==1.39.0",
+      "numpy==2.3.2",
+      "scipy==1.16.1",
+      "scikit-learn==1.7.2",
+      "soundfile==0.13.1"
+    ]
+  },
+  "models": {
+    "embedding": {
+      "repo_id": "iic/speech_campplus_sv_zh_en_16k-common_advanced",
+      "revision": "v1.0.0",
+      "checkpoint": "campplus_cn_en_common.pt",
+      "license": "Apache-2.0"
+    },
+    "vad": {
+      "repo_id": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+      "revision": "v2.0.4",
+      "license": "Apache-2.0"
+    }
+  },
+  "diarization": {
+    "stage_version": 1,
+    "mode": "offline_clustering",
+    "include_overlap": false,
+    "chunk_seconds": 1.5,
+    "chunk_step_seconds": 0.75,
+    "batch_size": 64,
+    "pval": 0.012,
+    "minimum_neighbours": 6,
+    "minimum_speakers": 1,
+    "maximum_speakers": 4
+  },
+  "word_assembly": {
+    "boundary_realign_enabled": false
+  },
+  "privacy": {
+    "embeddings_in_memory_only": true,
+    "persisted_output": "anonymous recording-local turns and scalar cluster-distance scores",
+    "voiceprints": false,
+    "cross_recording_identity": false
+  },
+  "limits": {
+    "maximum_speakers": 4,
+    "download_estimate_gb": 1.5,
+    "minimum_free_disk_gb": 4
+  },
+  "experimental": true
+}

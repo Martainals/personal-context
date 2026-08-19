@@ -19,7 +19,7 @@ Always begin with `bootstrap-status`. It is read-only and returns one of:
 Run `bootstrap-plan` and explain its returned facts, not a memorized approximation:
 
 - exact Vault and private configuration paths;
-- whether a model runtime will be installed and how much disk/network it needs;
+- whether one or two private model runtimes will be installed, each runtime's packages/models/source, aggregate download estimate, and conservative free-disk requirement;
 - selected processing mode and Agent host;
 - that local ASR has no cloud fallback;
 - that the surrounding chat application may already have received a user-uploaded attachment;
@@ -27,6 +27,13 @@ Run `bootstrap-plan` and explain its returned facts, not a memorized approximati
 - that local transcription persists checksummed stage artifacts by default, including text, alignment and raw recording-local diarization probabilities;
 - the exact private artifact path, that it contains no voiceprints or speaker embeddings, and that cleanup is manual with a dry-run preview;
 - that initial consent never approves long-term memory candidates.
+
+For `qwen-mlx-3dspeaker`, distinguish two cases from the generated plan:
+
+- a fresh machine installs the locked Qwen ASR/alignment runtime first and the locked 3D-Speaker/Torch diarization runtime second;
+- a machine whose Qwen runtime is already current installs only the missing diarization runtime.
+
+The experimental source installation requires a `git` executable and discloses that requirement in the plan before consent. The Skill repository contains only scripts, references and exact lock manifests. Packages, source checkouts, model weights, consent receipts and caches belong in the operating-system private configuration directory and must never be copied into the Skill checkout. `bootstrap-apply` verifies all consented runtimes after installation and must fail rather than report `ready` when any reported component is missing. Re-run `bootstrap-status` to see the missing components, then re-run `bootstrap-apply`; completed environments are not reinstalled.
 
 Do not run `record-consent` until the user explicitly accepts. Pass the exact current `plan_digest`; it binds the notice, Vault, mode, Provider profile and, for agent-assisted mode, Agent host. A stale, cross-mode, cross-Vault, or invented digest is rejected.
 
@@ -37,6 +44,8 @@ Do not run `record-consent` until the user explicitly accepts. Pass the exact cu
 `agent-assisted` additionally authorizes the named Agent host to process transcript text under that host's data policy. Changing host requires renewed consent. Changing provider, mode, Vault, or notice version also invalidates the receipt. Consent Notice 2 introduces default persistent transcription artifacts, so every receipt created under Notice 1 is intentionally invalid and must be renewed from a fresh `bootstrap-plan`; do not migrate or rewrite an old receipt in place.
 
 Receipts live in the operating-system user configuration directory or an explicit `--config-dir`, not in SQLite and not in the reusable Skill. They contain no transcript text or secrets.
+
+Always pass the explicitly selected experimental Provider through `bootstrap-plan`, `record-consent` and `bootstrap-apply`. Omitting it before a receipt exists falls back to `auto`, whose stable selection intentionally excludes the experimental Provider.
 
 ## Non-interactive design
 
