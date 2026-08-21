@@ -2,14 +2,14 @@
 
 Skill version and database Schema version are independent:
 
-- Skill version: `VERSION` (`0.7.0`)
+- Skill version: `VERSION` (`0.7.1`)
 - Current Schema: `1`
 - Minimum supported Schema: `1`
 - Maximum supported Schema: `1`
 - Consent notice: `2`
 - Provider contract: `1`
 - Artifact contract: `1`
-- `qwen-mlx` profile: `3`
+- `qwen-mlx` profile: `4`
 - `qwen-mlx-3dspeaker` profile: `1` (experimental)
 
 `version [--root ...]` reports both declarations and, when supplied, database compatibility.
@@ -27,6 +27,8 @@ Skill 0.5.1 makes transcription explicitly request-driven, returns an intact mat
 Skill 0.6.0 restores punctuation already produced by ASR after forced alignment, splits final segments at sentence endings or 0.8-second pauses, defaults speaker count to automatic unless the user volunteers a hint, and publishes title-based `YYYY-MM-DD HH：MM：SS-内容标题.md` deliveries. Agent-assisted hosts may prepare the short title from a private transient low-level transcript; strict-local mode never exposes text for title generation. Existing ASR, alignment and diarization artifacts remain reusable because punctuation restoration has its own assembly-key version. Schema 1, Provider/transcript contract 1, artifact contract 1, qwen-mlx profile 3 and Consent Notice 2 remain unchanged, so this release requires no database migration, model reinstall or consent renewal.
 
 Skill 0.7.0 adds the explicit experimental `qwen-mlx-3dspeaker` profile. It keeps the locked Qwen ASR and aligner, places 3D-Speaker/Torch in a separate runtime, persists only anonymous turns and scalar cluster-distance evidence, and keys the offline diarization stage independently from ASR and alignment. First-use planning lists both private environments on a fresh machine and only the missing diarizer for an existing current Qwen installation; interrupted installation is resumable and cannot report ready before every locked component passes status checks. The default `auto` choice and qwen-mlx profile 3 remain unchanged; existing qwen-mlx receipts and runtimes therefore remain valid. Selecting the experimental Provider changes the provider/profile digest and requires a new plan, explicit consent and installation. Schema 1, Provider/transcript contract 1, Artifact contract 1 and Consent Notice 2 remain unchanged.
+
+Skill 0.7.1 upgrades `qwen-mlx` to profile 4 and adds a conservative ASR recovery policy. A normal 240-second chunk retains its profile-3 component identity and remains reusable. A chunk dominated by a catastrophic repeated-character run is regenerated as 30-second slices, checked again, aligned slice by slice and stored under a distinct recovery key. A still-pathological smaller slice fails before publication. Existing diarization and valid ASR/alignment sibling chunks remain reusable. Model revisions, runtime packages, Schema 1, provider/transcript contract 1, Artifact contract 1 and Consent Notice 2 remain unchanged, so no model download or database migration is required; the changed Provider profile requires a renewed bootstrap plan, consent receipt and runtime marker.
 
 ## Compatibility behavior
 

@@ -631,6 +631,60 @@ def _runtime_packages_for(manifest: dict[str, Any], stage: str) -> list[str]:
     return [str(item) for item in packages]
 
 
+def _asr_recovery_profile(manifest: dict[str, Any]) -> dict[str, Any]:
+    configured = manifest.get("asr_recovery") or {}
+    profile = {
+        "version": int(configured.get("version", 1)),
+        "subchunk_seconds": int(configured.get("subchunk_seconds", 30)),
+        "minimum_text_characters": int(configured.get("minimum_text_characters", 200)),
+        "minimum_repeated_run_characters": int(
+            configured.get("minimum_repeated_run_characters", 80)
+        ),
+        "minimum_repeated_run_ratio": float(
+            configured.get("minimum_repeated_run_ratio", 0.25)
+        ),
+    }
+    if profile["version"] < 1 or profile["subchunk_seconds"] < 1:
+        raise RuntimeError("Invalid ASR recovery version or subchunk duration")
+    if profile["minimum_text_characters"] < 1:
+        raise RuntimeError("Invalid ASR recovery minimum text length")
+    if profile["minimum_repeated_run_characters"] < 2:
+        raise RuntimeError("Invalid ASR recovery repeated-run length")
+    if not 0.0 < profile["minimum_repeated_run_ratio"] <= 1.0:
+        raise RuntimeError("Invalid ASR recovery repeated-run ratio")
+    return profile
+
+
+def _detect_asr_pathology(
+    text: str, profile: dict[str, Any]
+) -> Optional[dict[str, Any]]:
+    compact = "".join(character for character in text if not character.isspace())
+    if len(compact) < int(profile["minimum_text_characters"]):
+        return None
+    longest = 0
+    current = 0
+    previous: Optional[str] = None
+    for character in compact:
+        if character == previous:
+            current += 1
+        else:
+            previous = character
+            current = 1
+        longest = max(longest, current)
+    ratio = longest / len(compact)
+    if (
+        longest < int(profile["minimum_repeated_run_characters"])
+        or ratio < float(profile["minimum_repeated_run_ratio"])
+    ):
+        return None
+    return {
+        "kind": "repeated-character-run",
+        "text_characters": len(compact),
+        "repeated_run_characters": longest,
+        "repeated_run_ratio": round(ratio, 6),
+    }
+
+
 def _cached_payload(
     store: Optional[ArtifactStore],
     *,
@@ -660,6 +714,62 @@ def _cached_payload(
             "status": "refreshed" if refresh else str(lookup_status or "miss"),
         }
     )
+    return payload, str(written.payload_sha256)
+
+
+def _cached_asr_payload(
+    store: Optional[ArtifactStore],
+    *,
+    name: str,
+    primary_cache_key: str,
+    recovery_cache_key: str,
+    recovery_profile: dict[str, Any],
+    refresh: bool,
+    compute_primary: Callable[[], dict[str, Any]],
+    compute_recovery: Callable[[dict[str, Any]], dict[str, Any]],
+    cache_events: list[dict[str, str]],
+) -> tuple[dict[str, Any], str]:
+    lookup_status: Optional[str] = None
+    cached_pathology: Optional[dict[str, Any]] = None
+    if store is not None and not refresh:
+        recovered = store.read("asr", name, recovery_cache_key)
+        if recovered.status == "hit":
+            cache_events.append({"stage": "asr", "name": name, "status": "hit"})
+            return dict(recovered.payload), str(recovered.payload_sha256)
+        primary = store.read("asr", name, primary_cache_key)
+        if primary.status == "hit":
+            payload = dict(primary.payload)
+            pathology = _detect_asr_pathology(str(payload.get("text", "")), recovery_profile)
+            if pathology is None:
+                cache_events.append({"stage": "asr", "name": name, "status": "hit"})
+                return payload, str(primary.payload_sha256)
+            lookup_status = "pathological"
+            cached_pathology = pathology
+        else:
+            lookup_status = primary.status
+
+    primary_payload = None if cached_pathology is not None else compute_primary()
+    pathology = cached_pathology or _detect_asr_pathology(
+        str((primary_payload or {}).get("text", "")), recovery_profile
+    )
+    recovered_payload = pathology is not None
+    payload = compute_recovery(pathology) if pathology is not None else dict(primary_payload or {})
+    selected_key = recovery_cache_key if recovered_payload else primary_cache_key
+    if store is None:
+        cache_events.append(
+            {
+                "stage": "asr",
+                "name": name,
+                "status": "recovered-disabled" if recovered_payload else "disabled",
+            }
+        )
+        return payload, component_cache_key(payload)
+    written = store.write("asr", name, selected_key, payload)
+    if recovered_payload:
+        status = "refreshed-recovered" if refresh else "recovered"
+    else:
+        status = "refreshed" if refresh else str(lookup_status or "miss")
+    cache_events.append({"stage": "asr", "name": name, "status": status})
     return payload, str(written.payload_sha256)
 
 
@@ -715,8 +825,11 @@ def transcribe(
     }
     chunk_seconds = int(manifest["limits"]["asr_chunk_seconds"])
     chunk_samples = chunk_seconds * sample_rate
+    asr_recovery_profile = _asr_recovery_profile(manifest)
+    recovery_subchunk_samples = int(asr_recovery_profile["subchunk_seconds"]) * sample_rate
     words: list[dict[str, Any]] = []
     fallbacks: list[dict[str, Any]] = []
+    asr_recoveries: list[dict[str, Any]] = []
     cache_events: list[dict[str, str]] = []
     store = (
         None
@@ -873,16 +986,79 @@ def transcribe(
                     )
                     return {"text": str(getattr(result, "text", result)).strip(), **chunk_identity}
 
-                asr_payload, asr_sha = _cached_payload(
+                recovery_key = component_cache_key(
+                    {
+                        **common_key,
+                        "component": "asr-recovery",
+                        "primary_cache_key": asr_key,
+                        "policy": asr_recovery_profile,
+                    }
+                )
+
+                def compute_recovery(pathology: dict[str, Any]) -> dict[str, Any]:
+                    recovery_slices = []
+                    model = ensure_asr_model()
+                    for recovery_index, relative_start in enumerate(
+                        range(0, len(chunk), recovery_subchunk_samples)
+                    ):
+                        recovery_chunk = chunk[
+                            relative_start : relative_start + recovery_subchunk_samples
+                        ]
+                        recovery_path = temporary_dir / (
+                            f"{chunk_name}-recovery-{recovery_index:05d}.wav"
+                        )
+                        _write_wav(recovery_path, recovery_chunk, sample_rate)
+                        result = (
+                            model.generate(str(recovery_path), language=language)
+                            if language
+                            else model.generate(str(recovery_path))
+                        )
+                        recovery_text = str(getattr(result, "text", result)).strip()
+                        if _detect_asr_pathology(recovery_text, asr_recovery_profile) is not None:
+                            raise RuntimeError(
+                                f"Pathological repetition remained in smaller ASR slice "
+                                f"{chunk_name}/{recovery_index:05d}; refusing to publish"
+                            )
+                        recovery_slices.append(
+                            {
+                                "relative_start_sample": relative_start,
+                                "sample_count": len(recovery_chunk),
+                                "text": recovery_text,
+                            }
+                        )
+                    return {
+                        "text": "".join(item["text"] for item in recovery_slices),
+                        **chunk_identity,
+                        "recovery": {
+                            "version": asr_recovery_profile["version"],
+                            "reason": pathology,
+                            "subchunk_seconds": asr_recovery_profile["subchunk_seconds"],
+                            "subchunks": len(recovery_slices),
+                        },
+                        "recovery_slices": recovery_slices,
+                    }
+
+                asr_payload, asr_sha = _cached_asr_payload(
                     store,
-                    stage="asr",
                     name=chunk_name,
-                    cache_key=asr_key,
+                    primary_cache_key=asr_key,
+                    recovery_cache_key=recovery_key,
+                    recovery_profile=asr_recovery_profile,
                     refresh=refresh_stage in {"asr", "all"},
-                    compute=compute_asr,
+                    compute_primary=compute_asr,
+                    compute_recovery=compute_recovery,
                     cache_events=cache_events,
                 )
                 text = str(asr_payload["text"])
+                recovery_details = asr_payload.get("recovery")
+                if isinstance(recovery_details, dict):
+                    asr_recoveries.append(
+                        {
+                            "chunk_index": index,
+                            "subchunks": int(recovery_details.get("subchunks", 0)),
+                            "reason": recovery_details.get("reason"),
+                        }
+                    )
                 alignment_key = component_cache_key(
                     {
                         **common_key,
@@ -897,33 +1073,81 @@ def transcribe(
                 )
 
                 def compute_alignment() -> dict[str, Any]:
-                    offset = start_sample / sample_rate
                     if not text:
-                        return {"words": [], "fallback": None, **chunk_identity}
-                    model = ensure_alignment_model()
-                    aligned = (
-                        model.generate(str(ensure_chunk_path()), text=text, language=language)
-                        if language
-                        else model.generate(str(ensure_chunk_path()), text=text)
-                    )
-                    chunk_words = []
-                    for item in _alignment_items(aligned):
-                        token = str(getattr(item, "text", "")).strip()
-                        if not token:
-                            continue
-                        start = offset + float(getattr(item, "start_time", 0.0))
-                        end = offset + float(
-                            getattr(item, "end_time", getattr(item, "start_time", 0.0))
-                        )
-                        chunk_words.append({"start": start, "end": max(start, end), "text": token})
-                    fallback = None
-                    if not chunk_words:
-                        fallback = {
-                            "start": offset,
-                            "end": offset + len(chunk) / sample_rate,
-                            "text": text,
+                        return {
+                            "words": [],
+                            "fallback": None,
+                            "fallbacks": [],
+                            **chunk_identity,
                         }
-                    return {"words": chunk_words, "fallback": fallback, **chunk_identity}
+                    model = ensure_alignment_model()
+                    chunk_words = []
+                    chunk_fallbacks = []
+
+                    def align_part(
+                        path: Path, part_text: str, offset: float, duration: float
+                    ) -> None:
+                        if not part_text:
+                            return
+                        aligned = (
+                            model.generate(str(path), text=part_text, language=language)
+                            if language
+                            else model.generate(str(path), text=part_text)
+                        )
+                        part_words = []
+                        for item in _alignment_items(aligned):
+                            token = str(getattr(item, "text", "")).strip()
+                            if not token:
+                                continue
+                            start = offset + float(getattr(item, "start_time", 0.0))
+                            end = offset + float(
+                                getattr(item, "end_time", getattr(item, "start_time", 0.0))
+                            )
+                            part_words.append(
+                                {"start": start, "end": max(start, end), "text": token}
+                            )
+                        if part_words:
+                            chunk_words.extend(part_words)
+                        else:
+                            chunk_fallbacks.append(
+                                {"start": offset, "end": offset + duration, "text": part_text}
+                            )
+
+                    recovery_slices = asr_payload.get("recovery_slices")
+                    if isinstance(recovery_slices, list):
+                        for recovery_index, recovery_slice in enumerate(recovery_slices):
+                            relative_start = int(recovery_slice["relative_start_sample"])
+                            sample_count = int(recovery_slice["sample_count"])
+                            part_text = str(recovery_slice["text"])
+                            recovery_path = temporary_dir / (
+                                f"{chunk_name}-recovery-{recovery_index:05d}.wav"
+                            )
+                            if not recovery_path.exists():
+                                _write_wav(
+                                    recovery_path,
+                                    chunk[relative_start : relative_start + sample_count],
+                                    sample_rate,
+                                )
+                            align_part(
+                                recovery_path,
+                                part_text,
+                                (start_sample + relative_start) / sample_rate,
+                                sample_count / sample_rate,
+                            )
+                    else:
+                        align_part(
+                            ensure_chunk_path(),
+                            text,
+                            start_sample / sample_rate,
+                            len(chunk) / sample_rate,
+                        )
+                    fallback = chunk_fallbacks[0] if len(chunk_fallbacks) == 1 else None
+                    return {
+                        "words": chunk_words,
+                        "fallback": fallback,
+                        "fallbacks": chunk_fallbacks if len(chunk_fallbacks) != 1 else [],
+                        **chunk_identity,
+                    }
 
                 alignment_payload, alignment_sha = _cached_payload(
                     store,
@@ -951,6 +1175,7 @@ def transcribe(
                 )
                 if alignment_payload.get("fallback") is not None:
                     fallbacks.append(alignment_payload["fallback"])
+                fallbacks.extend(alignment_payload.get("fallbacks") or [])
 
             assembly_key = component_cache_key(
                 {
@@ -1039,6 +1264,13 @@ def transcribe(
                     )
                     for status in sorted({item["status"] for item in punctuation_inputs})
                 },
+            },
+            "asr_recovery": {
+                "version": asr_recovery_profile["version"],
+                "chunks": len(asr_recoveries),
+                "subchunks": sum(item["subchunks"] for item in asr_recoveries),
+                "chunk_indices": [item["chunk_index"] for item in asr_recoveries],
+                "reasons": [item["reason"] for item in asr_recoveries],
             },
         },
     }

@@ -40,6 +40,7 @@ named audio file
 → decode, mono, 16 kHz normalization
 → cached high-context streaming Sortformer raw probabilities
 → cached ASR chunks of at most 240 seconds
+→ pathological-repetition check; affected chunks alone retry as cached 30-second slices
 → cached Qwen forced-alignment chunks
 → restore ASR punctuation onto aligned characters
 → cached speaker turns derived from raw probabilities
@@ -73,6 +74,8 @@ Post-processing removes sub-100 ms speech fragments, bridges sub-150 ms silence 
 
 Qwen ASR text normally contains punctuation, while forced alignment may return only timed characters. Punctuation restoration aligns the two character streams with Unicode normalization and maps punctuation back only when their content similarity is at least 0.95. It never supplies missing words; a low-similarity chunk fails closed and keeps its aligned text unchanged. Final assembly starts a new segment at sentence-ending punctuation or a pause of at least 0.8 seconds. Punctuation restoration version and per-chunk status are included in processing provenance and the final-assembly cache key, so upgrading this lightweight stage reuses ASR, alignment and diarization artifacts.
 
+Before alignment, the Provider checks each ASR chunk for a conservative catastrophic-decode signature: at least 200 non-whitespace characters, one identical-character run of at least 80 characters, and that run occupying at least 25% of the chunk text. A normal chunk keeps its existing ASR cache identity. Only a flagged chunk is regenerated as 30-second slices; every slice is checked again and aligned against its own audio before timestamps are shifted back to the recording timeline. The repaired chunk uses a separate cache key containing the primary ASR key and recovery policy. This preserves valid sibling chunks and prevents a recovered payload from masquerading as the original 240-second decode. If any smaller slice still matches the signature, transcription fails before publication.
+
 The Source must be the original audio. The default `capture-audio` path guarantees this association. Low-level callers must run `ingest` first and pass its `source_id` to `import-transcript`; otherwise the JSON file itself becomes the Source.
 
 The stage cache remains the only persisted recovery surface for model work. The transient transcript JSON is deleted after both success and failure, while cached valid stages allow a retry to resume computation. Inbox never stores Provider JSON, diagnostics or test reports; it receives only the completed Markdown delivery.
@@ -103,7 +106,7 @@ The five component keys are independently versioned:
 |---|---|---|
 | raw diarization | audio SHA, artifact/normalization/stage versions, diarizer revision, pinned runtime package versions, streaming and inference parameters | speaker count, post-processing, title, observed time |
 | offline diarization | audio SHA, artifact/normalization/stage versions, 3D-Speaker source/models/runtime, clustering parameters and speaker count | ASR, alignment, title, observed time |
-| ASR chunk | audio SHA, versions, ASR revision, pinned runtime package versions, language and chunk identity | speaker count, diarization rules, title, observed time |
+| ASR chunk | audio SHA, versions, ASR revision, pinned runtime package versions, language and chunk identity; recovered chunks additionally include the recovery policy and primary key | speaker count, diarization rules, title, observed time |
 | alignment chunk | audio SHA, versions, aligner revision, pinned runtime package versions, language, chunk identity and ASR payload hash | speaker count, title, observed time |
 | speaker turns | raw-diarization payload hash, speaker count and post-processing rules | ASR, alignment, title, observed time |
 | final assembly | alignment payload hashes, ASR punctuation-restoration inputs/version, speaker-turn payload hash and assembly rules | title and observed time |
@@ -144,5 +147,6 @@ scripts/context storage-status --root <vault>
 - Sortformer supports at most four speakers and may degrade with five or more speakers, non-English meetings, long recordings, noise, or overlapping speech.
 - `qwen-mlx-3dspeaker` has overlap handling disabled, remains experimental, and must pass a second representative problem recording before any proposal to change the default Provider.
 - ASR accuracy does not establish truth. Every speech Segment becomes a Claim Statement.
+- Catastrophic ASR repetition is retried once through smaller slices. A still-pathological slice fails closed; the Provider does not recurse indefinitely or publish it.
 - Do not silently substitute CAM++, pyannote, a cloud API, or another model. A future replacement must be a separately locked Provider and may require renewed consent.
 - Unit tests mock model installation and inference. A real model download and representative-audio evaluation are explicit integration steps.

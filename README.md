@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="Skill version 0.7.0" src="https://img.shields.io/badge/skill-0.7.0-0f766e?style=flat-square">
+  <img alt="Skill version 0.7.1" src="https://img.shields.io/badge/skill-0.7.1-0f766e?style=flat-square">
   <img alt="Schema version 1" src="https://img.shields.io/badge/schema-1-b7791f?style=flat-square">
   <img alt="Agent Skills open format" src="https://img.shields.io/badge/format-Agent%20Skills-334155?style=flat-square">
   <img alt="Python 3.9 or newer" src="https://img.shields.io/badge/core-Python%203.9%2B-334155?style=flat-square">
@@ -260,15 +260,15 @@ Vault 由用户选择，是唯一权威数据层：
 
 | 项目 | 当前值 |
 |---|---|
-| Skill | `0.7.0` |
+| Skill | `0.7.1` |
 | SQLite Schema | `1` |
 | Consent notice | `2` |
 | Provider contract | `1` |
 | Artifact contract | `1` |
-| qwen-mlx profile | `3` |
+| qwen-mlx profile | `4` |
 | qwen-mlx-3dspeaker profile | `1`（实验） |
 
-0.7.0 增加独立的 3D-Speaker 实验 Provider、人物距离分数和按阶段隔离的运行环境身份。默认 `qwen-mlx`、Schema、Provider/transcript contract、Artifact contract 与 Notice 都没有改变，所以现有默认 Provider 的数据库、模型和许可继续有效；只有主动选择实验 Provider 时才需要新计划、许可和额外安装。
+0.7.1 为 Qwen ASR 增加异常重复保护：正常 240 秒分块保持原缓存，只有出现灾难性单字循环的分块才以 30 秒切片重试并逐片对齐；短切片仍异常时停止发布。`qwen-mlx` 升级为 profile 4，因此需要更新本机计划与许可，但模型、Python 包、Schema、Provider/transcript contract、Artifact contract 和 Notice 都没有改变，不需要重新下载模型。
 
 项目根目录的 [`AGENTS.md`](./AGENTS.md) 是后续 Agent 开发和升级的唯一维护章程。`CLAUDE.md`、`GEMINI.md` 只引用它，避免多份规则漂移；Codex 的 `personal-context/agents/openai.yaml` 仅是可选界面元数据。
 

@@ -1910,7 +1910,7 @@ def version_info(root: Optional[Path]) -> dict[str, Any]:
         "provider_contract_version": 1,
         "artifact_contract_version": 1,
         "consent_notice_version": 2,
-        "qwen_mlx_profile_version": 3,
+        "qwen_mlx_profile_version": 4,
         "qwen_mlx_3dspeaker_profile_version": 1,
     }
     if root is not None:

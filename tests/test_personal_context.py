@@ -506,13 +506,14 @@ class PersonalContextTests(unittest.TestCase):
     def test_qwen_provider_profile_is_locked_and_lazy_loads_optional_dependencies(self) -> None:
         manifest = onboarding.load_manifest()
         self.assertEqual(manifest["provider"], "qwen-mlx")
-        self.assertEqual(manifest["profile_version"], 3)
+        self.assertEqual(manifest["profile_version"], 4)
         self.assertEqual(manifest["runtime"]["packages"], ["mlx-audio[stt]==0.4.6"])
         self.assertEqual(manifest["artifacts"]["contract_version"], 1)
         self.assertEqual(manifest["artifacts"]["format"], "json+gzip")
         self.assertEqual(manifest["diarization"]["mode"], "high_accuracy_streaming")
         self.assertEqual(manifest["diarization"]["streaming"]["chunk_frames"], 340)
         self.assertEqual(manifest["diarization"]["streaming"]["right_context_frames"], 40)
+        self.assertEqual(manifest["asr_recovery"]["subchunk_seconds"], 30)
         for model in manifest["models"].values():
             revision = model["revision"]
             self.assertEqual(len(revision), 40)
@@ -530,12 +531,12 @@ class PersonalContextTests(unittest.TestCase):
 
     def test_release_versions_keep_schema_and_transcript_contract_stable(self) -> None:
         versions = pc.version_info(None)
-        self.assertEqual(versions["skill_version"], "0.7.0")
+        self.assertEqual(versions["skill_version"], "0.7.1")
         self.assertEqual(versions["schema_version"], 1)
         self.assertEqual(versions["provider_contract_version"], 1)
         self.assertEqual(versions["artifact_contract_version"], 1)
         self.assertEqual(versions["consent_notice_version"], 2)
-        self.assertEqual(versions["qwen_mlx_profile_version"], 3)
+        self.assertEqual(versions["qwen_mlx_profile_version"], 4)
         self.assertEqual(versions["qwen_mlx_3dspeaker_profile_version"], 1)
 
     def test_known_speaker_count_removes_fragmentary_false_channels(self) -> None:

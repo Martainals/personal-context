@@ -1,5 +1,5 @@
 {
-  "profile_version": 3,
+  "profile_version": 4,
   "provider": "qwen-mlx",
   "display_name": "Qwen3-ASR BF16 for Apple Silicon",
   "platform": {
@@ -53,6 +53,13 @@
       "speaker-turns": 1,
       "assembly": 1
     }
+  },
+  "asr_recovery": {
+    "version": 1,
+    "subchunk_seconds": 30,
+    "minimum_text_characters": 200,
+    "minimum_repeated_run_characters": 80,
+    "minimum_repeated_run_ratio": 0.25
   },
   "diarization": {
     "mode": "high_accuracy_streaming",

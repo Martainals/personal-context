@@ -565,6 +565,199 @@ class ProviderStageCacheTests(unittest.TestCase):
         self.assertEqual(counters["diarization_generate"], cold_counts["diarization_generate"])
         self.assertEqual(cold.read_bytes(), repaired.read_bytes())
 
+    def test_pathological_asr_repetition_recovers_in_smaller_cached_slices(self) -> None:
+        counters = {
+            "asr_load": 0,
+            "alignment_load": 0,
+            "diarization_load": 0,
+            "asr_generate": 0,
+            "alignment_generate": 0,
+            "diarization_generate": 0,
+        }
+        manifest = copy.deepcopy(self.manifest)
+        manifest["limits"]["asr_chunk_seconds"] = 2
+        manifest["asr_recovery"] = {
+            "version": 1,
+            "subchunk_seconds": 1,
+            "minimum_text_characters": 100,
+            "minimum_repeated_run_characters": 50,
+            "minimum_repeated_run_ratio": 0.25,
+        }
+
+        class AsrModel:
+            def generate(self, path: str, language: Optional[str] = None) -> object:
+                del language
+                counters["asr_generate"] += 1
+                name = Path(path).stem
+                if name == "chunk-00000":
+                    return types.SimpleNamespace(text="语" * 500)
+                if name.endswith("00000"):
+                    return types.SimpleNamespace(text="你好。")
+                return types.SimpleNamespace(text="世界。")
+
+        class AlignerModel:
+            def generate(self, path: str, text: str, language: Optional[str] = None) -> object:
+                del path, language
+                counters["alignment_generate"] += 1
+                return [
+                    types.SimpleNamespace(
+                        text=text.rstrip("。"), start_time=0.0, end_time=0.4
+                    )
+                ]
+
+        class Modules:
+            chunk_len = 0
+            chunk_right_context = 0
+            fifo_len = 0
+            spkcache_update_period = 0
+            spkcache_len = 0
+
+        class DiarizerModel:
+            config = types.SimpleNamespace(
+                modules_config=Modules(),
+                processor_config=types.SimpleNamespace(hop_length=160, sampling_rate=16000),
+                fc_encoder_config=types.SimpleNamespace(subsampling_factor=8),
+            )
+
+            def generate_stream(self, path: str, **kwargs: object) -> list[object]:
+                del path, kwargs
+                counters["diarization_generate"] += 1
+                return [types.SimpleNamespace(speaker_probs=[[0.9, 0.1]] * 32)]
+
+        stt = types.ModuleType("mlx_audio.stt")
+        vad = types.ModuleType("mlx_audio.vad")
+
+        def load_stt(path: str) -> object:
+            if "ForcedAligner" in path:
+                counters["alignment_load"] += 1
+                return AlignerModel()
+            counters["asr_load"] += 1
+            return AsrModel()
+
+        def load_vad(path: str) -> object:
+            del path
+            counters["diarization_load"] += 1
+            return DiarizerModel()
+
+        stt.load = load_stt  # type: ignore[attr-defined]
+        vad.load = load_vad  # type: ignore[attr-defined]
+        package = types.ModuleType("mlx_audio")
+        package.stt = stt  # type: ignore[attr-defined]
+        package.vad = vad  # type: ignore[attr-defined]
+        modules = {"mlx_audio": package, "mlx_audio.stt": stt, "mlx_audio.vad": vad}
+
+        def fake_audio(_: Path) -> tuple[list[float], int]:
+            return [0.1] * 32000, 16000
+
+        def fake_wav(path: Path, samples: object, sample_rate: int = 16000) -> None:
+            del samples, sample_rate
+            path.write_bytes(b"normalized")
+
+        cold = self.base / "recovery-cold.json"
+        hot = self.base / "recovery-hot.json"
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(
+            qwen_mlx, "_to_mono_16k", side_effect=fake_audio
+        ), mock.patch.object(qwen_mlx, "_write_wav", side_effect=fake_wav):
+            qwen_mlx.transcribe(
+                manifest,
+                self.models_dir,
+                self.audio,
+                cold,
+                language="Chinese",
+                title="固定",
+                observed_at="2026-08-16T10:00:00Z",
+                speaker_count=1,
+                artifacts_dir=self.artifacts_dir,
+                vault_scope=self.scope,
+            )
+            cold_counts = dict(counters)
+            qwen_mlx.transcribe(
+                manifest,
+                self.models_dir,
+                self.audio,
+                hot,
+                language="Chinese",
+                title="固定",
+                observed_at="2026-08-16T10:00:00Z",
+                speaker_count=1,
+                artifacts_dir=self.artifacts_dir,
+                vault_scope=self.scope,
+            )
+
+        self.assertEqual(cold_counts["asr_generate"], 3)
+        self.assertEqual(cold_counts["alignment_generate"], 2)
+        self.assertEqual(counters, cold_counts)
+        self.assertEqual(cold.read_bytes(), hot.read_bytes())
+        document = json.loads(cold.read_text(encoding="utf-8"))
+        self.assertEqual(document["processing"]["asr_recovery"]["chunks"], 1)
+        self.assertEqual(document["processing"]["asr_recovery"]["subchunks"], 2)
+        self.assertEqual(
+            "".join(item["text"] for item in document["segments"]), "你好。世界。"
+        )
+
+    def test_asr_recovery_fails_closed_when_a_smaller_slice_is_still_pathological(self) -> None:
+        manifest = copy.deepcopy(self.manifest)
+        manifest["limits"]["asr_chunk_seconds"] = 1
+        manifest["asr_recovery"] = {
+            "version": 1,
+            "subchunk_seconds": 1,
+            "minimum_text_characters": 100,
+            "minimum_repeated_run_characters": 50,
+            "minimum_repeated_run_ratio": 0.25,
+        }
+        counters = {
+            "asr_load": 0,
+            "alignment_load": 0,
+            "diarization_load": 0,
+            "asr_generate": 0,
+            "alignment_generate": 0,
+            "diarization_generate": 0,
+        }
+        modules = self._fake_model_modules(counters)
+        asr_module = modules["mlx_audio.stt"]
+
+        class RepeatingAsrModel:
+            def generate(self, path: str, language: Optional[str] = None) -> object:
+                del path, language
+                counters["asr_generate"] += 1
+                return types.SimpleNamespace(text="语" * 500)
+
+        original_load = asr_module.load  # type: ignore[attr-defined]
+
+        def load_stt(path: str) -> object:
+            if "ForcedAligner" in path:
+                return original_load(path)
+            counters["asr_load"] += 1
+            return RepeatingAsrModel()
+
+        asr_module.load = load_stt  # type: ignore[attr-defined]
+
+        def fake_audio(_: Path) -> tuple[list[float], int]:
+            return [0.1] * 16000, 16000
+
+        def fake_wav(path: Path, samples: object, sample_rate: int = 16000) -> None:
+            del samples, sample_rate
+            path.write_bytes(b"normalized")
+
+        output = self.base / "recovery-failed.json"
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(
+            qwen_mlx, "_to_mono_16k", side_effect=fake_audio
+        ), mock.patch.object(qwen_mlx, "_write_wav", side_effect=fake_wav):
+            with self.assertRaisesRegex(RuntimeError, "smaller ASR slice"):
+                qwen_mlx.transcribe(
+                    manifest,
+                    self.models_dir,
+                    self.audio,
+                    output,
+                    language="Chinese",
+                    title="固定",
+                    observed_at="2026-08-16T10:00:00Z",
+                    speaker_count=1,
+                    artifacts_dir=self.artifacts_dir,
+                    vault_scope=self.scope,
+                )
+        self.assertFalse(output.exists())
+
     def test_no_cache_bypasses_storage_and_refresh_stage_is_targeted(self) -> None:
         counters = {
             "asr_load": 0,

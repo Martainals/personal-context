@@ -89,6 +89,26 @@ def offline_runtime_digest(manifest: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(identity).encode("utf-8")).hexdigest()
 
 
+def qwen_runtime_digest(
+    manifest: dict[str, Any], model_roles: Optional[tuple[str, ...]] = None
+) -> str:
+    """Hash only packages and model revisions installed in the Qwen runtime."""
+    selected_roles = tuple(model_roles or tuple(manifest["models"]))
+    identity = {
+        "provider": manifest["provider"],
+        "runtime": manifest["runtime"],
+        "models": {
+            role: {
+                key: manifest["models"][role][key]
+                for key in ("repo_id", "revision")
+                if key in manifest["models"][role]
+            }
+            for role in selected_roles
+        },
+    }
+    return hashlib.sha256(canonical_json(identity).encode("utf-8")).hexdigest()
+
+
 def notice_digest() -> str:
     return hashlib.sha256(canonical_json(NOTICE).encode("utf-8")).hexdigest()
 
@@ -281,11 +301,22 @@ def _qwen_runtime_status(
     marker_roles = set(
         (marker or {}).get("model_roles") or tuple(manifest["models"])
     )
+    expected_runtime_digest = qwen_runtime_digest(manifest, selected_roles)
+    legacy_profile_3_marker = bool(
+        marker
+        and marker.get("runtime_digest") is None
+        and marker.get("manifest_digest")
+        == "59c246c139563a578339f0bd9fdde16f71c35b1a570ddf0b18ec7d56a65db750"
+        and marker.get("python") == manifest["runtime"]["python"]
+        and marker.get("packages") == manifest["runtime"]["packages"]
+    )
     marker_current = bool(
         marker
         and marker.get("provider") == "qwen-mlx"
-        and marker.get("profile_version") == manifest.get("profile_version")
-        and marker.get("manifest_digest") == manifest_digest(manifest)
+        and (
+            marker.get("runtime_digest") == expected_runtime_digest
+            or legacy_profile_3_marker
+        )
         and set(selected_roles).issubset(marker_roles)
     )
     installed = (
@@ -652,6 +683,7 @@ def bootstrap_plan(
                     else base_manifest["diarization"]
                 ),
                 "artifacts": base_manifest.get("artifacts"),
+                "asr_recovery": base_manifest.get("asr_recovery"),
                 "experimental": bool(offline_manifest),
                 "privacy": offline_manifest.get("privacy") if offline_manifest else None,
             }
@@ -809,10 +841,10 @@ def install_qwen_mlx_runtime(
         env=env,
     )
     previous_marker = _read_json(runtime / "runtime.json") or {}
+    current_runtime_digest = qwen_runtime_digest(manifest, selected_roles)
     previous_marker_current = bool(
         previous_marker.get("provider") == "qwen-mlx"
-        and previous_marker.get("profile_version") == manifest["profile_version"]
-        and previous_marker.get("manifest_digest") == manifest_digest(manifest)
+        and previous_marker.get("runtime_digest") == current_runtime_digest
     )
     previous_roles = (
         set(previous_marker.get("model_roles") or tuple(manifest["models"]))
@@ -823,6 +855,7 @@ def install_qwen_mlx_runtime(
         "provider": "qwen-mlx",
         "profile_version": manifest["profile_version"],
         "manifest_digest": manifest_digest(manifest),
+        "runtime_digest": current_runtime_digest,
         "installed_at": utc_now(),
         "python": manifest["runtime"]["python"],
         "packages": manifest["runtime"]["packages"],

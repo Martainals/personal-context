@@ -614,6 +614,69 @@ class ExperimentalProviderPlanTests(unittest.TestCase):
             onboarding.offline_runtime_digest(changed),
         )
 
+    def test_qwen_processing_policy_renews_consent_without_reinstalling_models(self) -> None:
+        manifest = onboarding.load_manifest("qwen-mlx")
+        changed_policy = copy.deepcopy(manifest)
+        changed_policy["asr_recovery"]["minimum_repeated_run_characters"] += 1
+        self.assertEqual(
+            onboarding.qwen_runtime_digest(manifest),
+            onboarding.qwen_runtime_digest(changed_policy),
+        )
+        changed_model = copy.deepcopy(manifest)
+        changed_model["models"]["asr"]["revision"] = "1" * 40
+        self.assertNotEqual(
+            onboarding.qwen_runtime_digest(manifest),
+            onboarding.qwen_runtime_digest(changed_model),
+        )
+
+        compatible = {
+            "system": "Darwin",
+            "machine": "arm64",
+            "python": "3.9.0",
+            "qwen_mlx_compatible": True,
+            "qwen_mlx_reason": None,
+            "git_available": True,
+            "git_path": "/usr/bin/git",
+        }
+        with tempfile.TemporaryDirectory(prefix="personal-context-qwen-upgrade-") as temporary:
+            base = Path(temporary)
+            root = base / "vault"
+            config = base / "config"
+            runtime = onboarding.runtime_dir(config)
+            python_path = onboarding._venv_python(runtime / "venv")
+            python_path.parent.mkdir(parents=True)
+            python_path.write_bytes(b"synthetic")
+            for model in manifest["models"].values():
+                (
+                    runtime
+                    / "models"
+                    / model["repo_id"].replace("/", "--")
+                ).mkdir(parents=True)
+            onboarding._write_private_json(
+                runtime / "runtime.json",
+                {
+                    "provider": "qwen-mlx",
+                    "profile_version": 3,
+                    "manifest_digest": "59c246c139563a578339f0bd9fdde16f71c35b1a570ddf0b18ec7d56a65db750",
+                    "python": manifest["runtime"]["python"],
+                    "packages": manifest["runtime"]["packages"],
+                    "model_roles": list(manifest["models"]),
+                },
+            )
+            with mock.patch.object(onboarding, "platform_probe", return_value=compatible):
+                status = onboarding.provider_status("qwen-mlx", config)
+                plan = onboarding.bootstrap_plan(
+                    root,
+                    config_dir=config,
+                    mode="strict-local",
+                    provider="qwen-mlx",
+                    agent_host="codex",
+                    database_state={"status": "current", "version": 1},
+                )
+        self.assertTrue(status["ready"])
+        self.assertFalse(plan["installation"]["required"])
+        self.assertEqual(plan["provider_profile"]["asr_recovery"]["subchunk_seconds"], 30)
+
     def test_experimental_provider_is_explicit_and_auto_default_does_not_change(self) -> None:
         self.assertEqual(onboarding.select_provider("auto"), "qwen-mlx")
         self.assertEqual(
@@ -629,7 +692,7 @@ class ExperimentalProviderPlanTests(unittest.TestCase):
         )
         self.assertEqual(
             onboarding.manifest_digest(onboarding.load_manifest("qwen-mlx")),
-            "59c246c139563a578339f0bd9fdde16f71c35b1a570ddf0b18ec7d56a65db750",
+            "e247c08fecc9d9c299821b29b6e643f60b19d0305f08e446201fb3ffc2f1d92e",
         )
 
     def test_bootstrap_plan_discloses_separate_runtime_and_in_memory_voice_features(self) -> None:
