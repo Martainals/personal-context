@@ -9,6 +9,7 @@ timeline with scalar confidence and margin values.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -264,6 +265,42 @@ def _cluster_labels(embeddings: Any, speaker_count: Optional[int], settings: dic
     )
 
 
+def _result_details(
+    manifest: dict[str, Any],
+    *,
+    speaker_count: Optional[int],
+    output_speakers: int,
+    speech_chunks: int,
+) -> dict[str, Any]:
+    model_roles = {
+        "embedding": "speaker_encoder",
+        "vad": "vad",
+    }
+    unknown_roles = sorted(set(manifest["models"]) - set(model_roles))
+    if unknown_roles:
+        raise RuntimeError(
+            "3D-Speaker result metadata has unknown model roles: "
+            + ", ".join(unknown_roles)
+        )
+    models = {
+        model_roles[role]: {
+            "repo_id": item["repo_id"],
+            "revision": item["revision"],
+        }
+        for role, item in manifest["models"].items()
+    }
+    return {
+        "backend": "3dspeaker-offline",
+        "mode": "offline_clustering",
+        "expected_speakers": speaker_count,
+        "output_speakers": int(output_speakers),
+        "evidence": "cluster-distance",
+        "speech_chunks": int(speech_chunks),
+        "source_revision": manifest["source"]["revision"],
+        "models": models,
+    }
+
+
 def diarize(
     manifest: dict[str, Any],
     source_dir: Path,
@@ -325,19 +362,12 @@ def diarize(
     segments = anonymous_segments_with_evidence(chunks, labels.tolist(), evidence.tolist())
     return {
         "segments": segments,
-        "details": {
-            "backend": "3dspeaker-offline",
-            "mode": "offline_clustering",
-            "expected_speakers": speaker_count,
-            "output_speakers": len({item["speaker"] for item in segments}),
-            "evidence": "cluster-distance",
-            "speech_chunks": len(chunks),
-            "source_revision": manifest["source"]["revision"],
-            "models": {
-                role: {"repo_id": item["repo_id"], "revision": item["revision"]}
-                for role, item in manifest["models"].items()
-            },
-        },
+        "details": _result_details(
+            manifest,
+            speaker_count=speaker_count,
+            output_speakers=len({item["speaker"] for item in segments}),
+            speech_chunks=len(chunks),
+        ),
     }
 
 
@@ -348,6 +378,11 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--manifest", required=True)
     command.add_argument("--source-dir", required=True)
     command.add_argument("--models-dir", required=True)
+    command = subparsers.add_parser("preflight")
+    command.add_argument("--manifest", required=True)
+    command.add_argument("--source-dir", required=True)
+    command.add_argument("--models-dir", required=True)
+    command.add_argument("--speaker-count", type=int, choices=range(1, 5))
     command = subparsers.add_parser("diarize")
     command.add_argument("--manifest", required=True)
     command.add_argument("--source-dir", required=True)
@@ -365,14 +400,27 @@ def main() -> int:
             result = download_models(
                 manifest, Path(args.source_dir).resolve(), Path(args.models_dir).resolve()
             )
+        elif args.command == "preflight":
+            result = {
+                "details": _result_details(
+                    manifest,
+                    speaker_count=args.speaker_count,
+                    output_speakers=0,
+                    speech_chunks=0,
+                )
+            }
         else:
-            result = diarize(
-                manifest,
-                Path(args.source_dir).resolve(),
-                Path(args.models_dir).resolve(),
-                Path(args.audio).resolve(),
-                args.speaker_count,
-            )
+            # Third-party inference libraries may print notices to stdout. Keep the
+            # subprocess protocol strict by routing those notices to stderr and
+            # reserving stdout for the single JSON result below.
+            with contextlib.redirect_stdout(sys.stderr):
+                result = diarize(
+                    manifest,
+                    Path(args.source_dir).resolve(),
+                    Path(args.models_dir).resolve(),
+                    Path(args.audio).resolve(),
+                    args.speaker_count,
+                )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except Exception as exc:

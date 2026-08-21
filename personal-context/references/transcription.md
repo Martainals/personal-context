@@ -16,6 +16,8 @@ Exact Hugging Face revisions, package versions, licenses, chunk sizes, and disk 
 
 The experimental subprocess computes speaker embeddings and cluster centres in memory, derives one recording-local anonymous label plus scalar confidence/margin for each turn, then discards all vectors. Only the anonymous timeline and scalar distance evidence may enter the artifact store. Do not add an embedding, centroid, voiceprint or cross-recording identity field to this contract.
 
+Before starting whole-recording inference, the parent Provider calls the isolated subprocess's metadata-only `preflight` action and applies the same artifact safety validator used by the cache. Model provenance uses the public role name `speaker_encoder`; it never includes vectors. An unsafe or incompatible return shape must therefore fail before the long-running model starts, while the completed result is validated again during the atomic cache write.
+
 The private installer bootstraps pinned `uv`, lets it install a private Python 3.12, creates an isolated virtual environment, installs pinned `mlx-audio`, and downloads pinned snapshots beneath the private runtime directory. It does not modify system Python or shell profiles and does not start a server.
 
 ## Provider contract
@@ -55,11 +57,13 @@ The experimental profile replaces only the two Sortformer steps:
 cached ASR chunks + cached Qwen forced-alignment chunks
 ↘ isolated 3D-Speaker whole-recording clustering
   → cached anonymous turns with scalar cluster-distance evidence
-→ word-timestamp assignment with broad boundary snapping disabled
+→ word-timestamp assignment with broad snapping disabled and conservative sentence-tail absorption
 → cached final assembly
 ```
 
 Changing the experimental diarizer source, models or runtime packages invalidates only `diarization/offline-turns` and final assembly. It must not invalidate ASR or alignment chunks. The Qwen and Torch environments stay separate so their package identities never share one component cache key.
+
+The private 3D-Speaker runtime marker is derived only from its Python, packages, source revision and model revisions. Changing clustering or word-assembly parameters renews the Provider consent and invalidates the affected stage cache, but it must not reinstall packages or model weights.
 
 Completed recordings use the pinned high-accuracy streaming profile: 340 new frames, 40 future-context frames, 40 FIFO frames, a 300-frame cache update period, and 188 speaker-cache frames. At 80 ms per diarization frame this gives 27.2 seconds of new audio plus 3.2 seconds of future context per main step. The Provider then consolidates probabilities over the whole recording before assigning words.
 
@@ -106,7 +110,7 @@ The five component keys are independently versioned:
 
 Therefore changing `title` or `observed_at` only changes the final document metadata. Changing `speaker_count` or post-processing derives new turns from cached raw probabilities without rerunning ASR, alignment or the diarizer. A model, package, language, normalization, chunking or stage-version change invalidates only components whose key names that input.
 
-For `qwen-mlx-3dspeaker`, changing `speaker_count` reruns only offline diarization because clustering itself uses that count. ASR and alignment remain reusable. Its word assembly starts with `boundary_realign_enabled=false`: punctuation and pauses still split readable transcript segments, but they cannot by themselves move a person boundary. Actual cluster-distance margin may support the existing short weak-island repair; temporal overlap must never be presented as speaker confidence.
+For `qwen-mlx-3dspeaker`, changing `speaker_count` reruns only offline diarization because clustering itself uses that count. ASR and alignment remain reusable. Its word assembly keeps broad bidirectional snapping disabled. A separate conservative rule may return a short punctuated sentence tail to the preceding speaker only when that speaker's text is incomplete, the tail is followed by a clear pause, and the newly detected speaker continues afterward. Configured short replies and interjections remain protected as real turns. Actual cluster-distance margin may support the existing short weak-island repair; temporal overlap must never be presented as speaker confidence.
 
 Operational controls:
 

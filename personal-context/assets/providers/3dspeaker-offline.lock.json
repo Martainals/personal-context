@@ -19,11 +19,14 @@
     "packages": [
       "torch==2.8.0",
       "torchaudio==2.8.0",
-      "modelscope[audio]==1.39.0",
+      "modelscope[framework]==1.39.0",
+      "funasr==1.4.2",
       "numpy==2.3.2",
       "scipy==1.16.1",
       "scikit-learn==1.7.2",
-      "soundfile==0.13.1"
+      "soundfile==0.13.1",
+      "PyYAML==6.0.2",
+      "tqdm==4.67.1"
     ]
   },
   "models": {
@@ -52,7 +55,26 @@
     "maximum_speakers": 4
   },
   "word_assembly": {
-    "boundary_realign_enabled": false
+    "boundary_realign_enabled": false,
+    "sentence_tail_absorption_enabled": true,
+    "sentence_tail_join_gap_seconds": 0.2,
+    "sentence_tail_max_characters": 4,
+    "sentence_tail_max_seconds": 0.8,
+    "sentence_tail_pause_seconds": 0.2,
+    "sentence_tail_protected_responses": [
+      "嗯",
+      "啊",
+      "哦",
+      "对",
+      "是",
+      "好",
+      "行",
+      "对的",
+      "没错",
+      "操",
+      "我操",
+      "卧槽"
+    ]
   },
   "privacy": {
     "embeddings_in_memory_only": true,

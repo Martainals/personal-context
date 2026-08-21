@@ -17,7 +17,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 try:
-    from .artifacts import ARTIFACT_CONTRACT_VERSION, ArtifactStore, component_cache_key
+    from .artifacts import (
+        ARTIFACT_CONTRACT_VERSION,
+        ArtifactStore,
+        component_cache_key,
+        validate_artifact_payload,
+    )
     from .transcript_assembly import (
         PUNCTUATION_RESTORATION_VERSION,
         assemble_transcript_segments,
@@ -30,7 +35,12 @@ try:
         speaker_for,
     )
 except ImportError:  # Direct execution from the providers directory.
-    from artifacts import ARTIFACT_CONTRACT_VERSION, ArtifactStore, component_cache_key
+    from artifacts import (
+        ARTIFACT_CONTRACT_VERSION,
+        ArtifactStore,
+        component_cache_key,
+        validate_artifact_payload,
+    )
     from transcript_assembly import (
         PUNCTUATION_RESTORATION_VERSION,
         assemble_transcript_segments,
@@ -463,6 +473,37 @@ def _collect_diarization(
 def _run_offline_diarization(
     command: list[str], audio_path: Path, speaker_count: Optional[int]
 ) -> dict[str, Any]:
+    if len(command) < 3 or command[2] != "diarize":
+        raise RuntimeError("Offline diarization command is missing its protocol action")
+    preflight_invocation = [*command]
+    preflight_invocation[2] = "preflight"
+    if speaker_count is not None:
+        preflight_invocation.extend(["--speaker-count", str(speaker_count)])
+    preflight = subprocess.run(
+        preflight_invocation, capture_output=True, text=True, check=False
+    )
+    if preflight.returncode != 0:
+        details = (preflight.stderr or preflight.stdout or "unknown error")[-6000:]
+        raise RuntimeError(
+            f"Offline diarization preflight failed: {details.strip()}"
+        )
+    try:
+        preflight_payload = json.loads(preflight.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Offline diarization preflight returned invalid JSON: {exc}"
+        ) from exc
+    if not isinstance(preflight_payload, dict) or not isinstance(
+        preflight_payload.get("details"), dict
+    ):
+        raise RuntimeError("Offline diarization preflight is missing result metadata")
+    try:
+        validate_artifact_payload(preflight_payload)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Offline diarization preflight rejected unsafe artifact metadata: {exc}"
+        ) from exc
+
     invocation = [*command, "--audio", str(audio_path)]
     if speaker_count is not None:
         invocation.extend(["--speaker-count", str(speaker_count)])
@@ -501,6 +542,29 @@ def _run_offline_diarization(
         ):
             raise RuntimeError("Offline diarization segment has invalid scalar values")
     return {"segments": segments, "details": details}
+
+
+def _build_offline_command(
+    python_path: str,
+    script_path: str,
+    manifest_path: str,
+    source_dir: str,
+    models_dir: str,
+) -> list[str]:
+    # A virtualenv's Python is normally a symlink. Resolving it would bypass the
+    # virtualenv and run the base interpreter without the pinned diarizer packages.
+    python_executable = Path(python_path).expanduser().absolute()
+    return [
+        str(python_executable),
+        str(Path(script_path).expanduser().resolve()),
+        "diarize",
+        "--manifest",
+        str(Path(manifest_path).expanduser().resolve()),
+        "--source-dir",
+        str(Path(source_dir).expanduser().resolve()),
+        "--models-dir",
+        str(Path(models_dir).expanduser().resolve()),
+    ]
 
 
 # Preserve the provider's historical private names while keeping all word/turn
@@ -1070,17 +1134,13 @@ def main() -> int:
                 )
                 if not isinstance(offline_manifest, dict):
                     raise RuntimeError("Offline diarization manifest must be a JSON object")
-                offline_command = [
-                    str(Path(args.offline_python).resolve()),
-                    str(Path(args.offline_script).resolve()),
-                    "diarize",
-                    "--manifest",
+                offline_command = _build_offline_command(
+                    args.offline_python,
+                    args.offline_script,
                     str(offline_manifest_path),
-                    "--source-dir",
-                    str(Path(args.offline_source_dir).resolve()),
-                    "--models-dir",
-                    str(Path(args.offline_models_dir).resolve()),
-                ]
+                    args.offline_source_dir,
+                    args.offline_models_dir,
+                )
                 offline_runner = lambda audio, count: _run_offline_diarization(
                     offline_command, audio, count
                 )

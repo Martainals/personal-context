@@ -306,6 +306,96 @@ def realign_word_boundaries(
     return realigned
 
 
+def absorb_sentence_tail_boundaries(
+    words: list[dict[str, Any]], settings: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Return a short sentence tail to the preceding speaker without erasing replies."""
+    adjusted = [dict(item) for item in words]
+    if len(adjusted) < 3:
+        return adjusted
+
+    join_gap_seconds = float(settings.get("sentence_tail_join_gap_seconds", 0.2))
+    pause_seconds = float(settings.get("sentence_tail_pause_seconds", 0.2))
+    max_characters = int(settings.get("sentence_tail_max_characters", 4))
+    max_seconds = float(settings.get("sentence_tail_max_seconds", 0.8))
+    configured_responses = settings.get("sentence_tail_protected_responses")
+    protected_responses = {
+        str(item)
+        for item in (
+            configured_responses
+            if isinstance(configured_responses, list)
+            else ["嗯", "啊", "哦", "对", "是", "好", "行", "对的", "没错", "操", "我操", "卧槽"]
+        )
+    }
+
+    boundaries = [
+        index
+        for index in range(1, len(adjusted))
+        if adjusted[index]["speaker"] != adjusted[index - 1]["speaker"]
+    ]
+    for boundary in boundaries:
+        old_speaker = adjusted[boundary - 1]["speaker"]
+        new_speaker = adjusted[boundary]["speaker"]
+        if old_speaker == new_speaker:
+            continue
+        boundary_gap = float(adjusted[boundary]["start"]) - float(
+            adjusted[boundary - 1]["end"]
+        )
+        previous_text = str(adjusted[boundary - 1].get("text", "")).rstrip()
+        if boundary_gap > join_gap_seconds or not previous_text or _ends_sentence(previous_text):
+            continue
+
+        candidate_end: Optional[int] = None
+        compact_characters = 0
+        for end in range(boundary, len(adjusted) - 1):
+            if adjusted[end]["speaker"] != new_speaker:
+                break
+            if end > boundary:
+                internal_gap = float(adjusted[end]["start"]) - float(
+                    adjusted[end - 1]["end"]
+                )
+                if internal_gap > join_gap_seconds:
+                    break
+            token = "".join(
+                character
+                for character in str(adjusted[end].get("text", ""))
+                if not character.isspace() and character not in _PUNCTUATION
+            )
+            compact_characters += len(token)
+            duration = float(adjusted[end]["end"]) - float(adjusted[boundary]["start"])
+            if compact_characters > max_characters or duration > max_seconds:
+                break
+            candidate_text = "".join(
+                str(item.get("text", "")) for item in adjusted[boundary : end + 1]
+            )
+            pause_after = float(adjusted[end + 1]["start"]) - float(
+                adjusted[end]["end"]
+            )
+            if (
+                _ends_sentence(candidate_text)
+                and pause_after >= pause_seconds
+                and adjusted[end + 1]["speaker"] == new_speaker
+            ):
+                candidate_end = end + 1
+                break
+        if candidate_end is None:
+            continue
+
+        candidate_text = "".join(
+            str(item.get("text", "")) for item in adjusted[boundary:candidate_end]
+        )
+        compact = "".join(
+            character
+            for character in candidate_text
+            if not character.isspace() and character not in _PUNCTUATION
+        )
+        if not compact or compact in protected_responses:
+            continue
+        for item in adjusted[boundary:candidate_end]:
+            item["speaker"] = old_speaker
+    return adjusted
+
+
 def joins_without_space(left: str, right: str) -> bool:
     if not left or not right:
         return True
@@ -330,6 +420,8 @@ def merge_words(
         )
     if bool(settings.get("boundary_realign_enabled", True)):
         labeled = realign_word_boundaries(labeled, settings)
+    if bool(settings.get("sentence_tail_absorption_enabled", False)):
+        labeled = absorb_sentence_tail_boundaries(labeled, settings)
     labeled = smooth_word_speakers(labeled, settings)
     merged: list[dict[str, Any]] = []
     sentence_pause = float(settings.get("sentence_pause_seconds", 0.8))

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import copy
+import contextlib
+import io
 import json
+import subprocess
 import sys
 import tempfile
 import types
@@ -17,12 +20,326 @@ SCRIPTS = REPO_ROOT / "personal-context" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import diarization_3dspeaker  # noqa: E402
+import artifacts  # noqa: E402
 import personal_context_bootstrap as onboarding  # noqa: E402
 import qwen_mlx  # noqa: E402
 import transcript_assembly  # noqa: E402
 
 
 class DiarizationEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def _sentence_tail_settings() -> dict[str, object]:
+        return {
+            "boundary_realign_enabled": False,
+            "sentence_tail_absorption_enabled": True,
+            "sentence_tail_join_gap_seconds": 0.2,
+            "sentence_tail_max_characters": 4,
+            "sentence_tail_max_seconds": 0.8,
+            "sentence_tail_pause_seconds": 0.2,
+            "max_fragment_characters": 0,
+            "max_fragment_seconds": 0.0,
+            "max_fragment_gap_seconds": 0.0,
+            "max_fragment_margin": 0.0,
+            "max_same_speaker_gap_seconds": 1.2,
+            "max_segment_characters": 280,
+            "sentence_pause_seconds": 0.8,
+        }
+
+    def test_sentence_tail_absorption_keeps_question_with_previous_speaker(self) -> None:
+        words = [
+            {"start": 3.28, "end": 3.84, "text": "你不是买"},
+            {"start": 4.0, "end": 4.4, "text": "了是吧？"},
+            {"start": 4.64, "end": 5.2, "text": "不是，是这样。"},
+        ]
+        diarization = [
+            {
+                "start": 3.0,
+                "end": 4.125,
+                "speaker": 0,
+                "confidence": 0.8,
+                "margin": 0.25,
+            },
+            {
+                "start": 4.125,
+                "end": 6.0,
+                "speaker": 1,
+                "confidence": 0.8,
+                "margin": 0.4,
+            },
+        ]
+
+        segments = transcript_assembly.merge_words(
+            words, diarization, self._sentence_tail_settings()
+        )
+
+        self.assertEqual(
+            [(item["speaker"], item["text"]) for item in segments],
+            [("S01", "你不是买了是吧？"), ("S02", "不是，是这样。")],
+        )
+
+    def test_sentence_tail_absorption_preserves_real_short_interjection(self) -> None:
+        words = [
+            {"start": 1.12, "end": 1.84, "text": "不能再熬夜了，我"},
+            {"start": 1.92, "end": 2.0, "text": "操！"},
+            {"start": 2.4, "end": 3.28, "text": "啊，你买了？"},
+        ]
+        diarization = [
+            {
+                "start": 0.0,
+                "end": 1.875,
+                "speaker": 0,
+                "confidence": 0.8,
+                "margin": 0.25,
+            },
+            {
+                "start": 1.875,
+                "end": 4.125,
+                "speaker": 1,
+                "confidence": 0.8,
+                "margin": 0.25,
+            },
+        ]
+
+        segments = transcript_assembly.merge_words(
+            words, diarization, self._sentence_tail_settings()
+        )
+
+        self.assertEqual(
+            [(item["speaker"], item["text"]) for item in segments],
+            [
+                ("S01", "不能再熬夜了，我"),
+                ("S02", "操！"),
+                ("S02", "啊，你买了？"),
+            ],
+        )
+
+    def test_sentence_tail_absorption_never_steals_after_complete_sentence(self) -> None:
+        words = [
+            {"start": 0.0, "end": 1.0, "text": "我已经说完了。"},
+            {"start": 1.08, "end": 1.4, "text": "你呢？"},
+            {"start": 1.6, "end": 2.2, "text": "我觉得可以。"},
+        ]
+        diarization = [
+            {
+                "start": 0.0,
+                "end": 1.04,
+                "speaker": 0,
+                "confidence": 0.9,
+                "margin": 0.6,
+            },
+            {
+                "start": 1.04,
+                "end": 3.0,
+                "speaker": 1,
+                "confidence": 0.9,
+                "margin": 0.6,
+            },
+        ]
+
+        segments = transcript_assembly.merge_words(
+            words, diarization, self._sentence_tail_settings()
+        )
+
+        self.assertEqual(
+            [(item["speaker"], item["text"]) for item in segments],
+            [
+                ("S01", "我已经说完了。"),
+                ("S02", "你呢？"),
+                ("S02", "我觉得可以。"),
+            ],
+        )
+
+    def test_diarizer_model_provenance_is_safe_for_the_artifact_store(self) -> None:
+        manifest = onboarding.load_manifest("qwen-mlx-3dspeaker")
+        details = diarization_3dspeaker._result_details(
+            manifest,
+            speaker_count=2,
+            output_speakers=2,
+            speech_chunks=4,
+        )
+        payload = {
+            "segments": [
+                {
+                    "start": 0.0,
+                    "end": 1.0,
+                    "speaker": 0,
+                    "confidence": 0.9,
+                    "margin": 0.8,
+                }
+            ],
+            "details": details,
+        }
+
+        with tempfile.TemporaryDirectory(prefix="personal-context-safe-provenance-") as temporary:
+            store = artifacts.ArtifactStore(
+                Path(temporary),
+                "a" * 64,
+                "b" * 64,
+            )
+            written = store.write("diarization", "offline-turns", "c" * 64, payload)
+
+        self.assertEqual(written.status, "hit")
+        self.assertIn("speaker_encoder", details["models"])
+        self.assertNotIn("embedding", details["models"])
+
+    def test_offline_protocol_preflight_rejects_unsafe_metadata_before_inference(self) -> None:
+        unsafe_payload = {
+            "segments": [
+                {
+                    "start": 0.0,
+                    "end": 1.0,
+                    "speaker": 0,
+                    "confidence": 0.9,
+                    "margin": 0.8,
+                }
+            ],
+            "details": {
+                "backend": "3dspeaker-offline",
+                "speaker_embedding": [0.1, 0.2],
+            },
+        }
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(unsafe_payload),
+            stderr="",
+        )
+        command = [
+            "/private/runtime/venv/bin/python",
+            "/private/runtime/diarization_3dspeaker.py",
+            "diarize",
+            "--manifest",
+            "/private/runtime/manifest.json",
+            "--source-dir",
+            "/private/runtime/source",
+            "--models-dir",
+            "/private/runtime/models",
+        ]
+
+        with mock.patch.object(qwen_mlx.subprocess, "run", return_value=completed) as run:
+            with self.assertRaisesRegex(RuntimeError, "preflight"):
+                qwen_mlx._run_offline_diarization(command, Path("audio.wav"), 2)
+
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("preflight", run.call_args.args[0])
+        self.assertNotIn("--audio", run.call_args.args[0])
+
+    def test_offline_protocol_runs_inference_after_safe_preflight(self) -> None:
+        safe_details = {
+            "backend": "3dspeaker-offline",
+            "models": {
+                "speaker_encoder": {"repo_id": "example/encoder", "revision": "v1"},
+                "vad": {"repo_id": "example/vad", "revision": "v2"},
+            },
+        }
+        segment = {
+            "start": 0.0,
+            "end": 1.0,
+            "speaker": 0,
+            "confidence": 0.9,
+            "margin": 0.8,
+        }
+        responses = [
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=json.dumps({"details": safe_details}),
+                stderr="",
+            ),
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=json.dumps({"segments": [segment], "details": safe_details}),
+                stderr="",
+            ),
+        ]
+        command = [
+            "/private/runtime/venv/bin/python",
+            "/private/runtime/diarization_3dspeaker.py",
+            "diarize",
+            "--manifest",
+            "/private/runtime/manifest.json",
+            "--source-dir",
+            "/private/runtime/source",
+            "--models-dir",
+            "/private/runtime/models",
+        ]
+
+        with mock.patch.object(qwen_mlx.subprocess, "run", side_effect=responses) as run:
+            result = qwen_mlx._run_offline_diarization(command, Path("audio.wav"), 2)
+
+        self.assertEqual(result["segments"], [segment])
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("preflight", run.call_args_list[0].args[0])
+        self.assertNotIn("--audio", run.call_args_list[0].args[0])
+        self.assertIn("diarize", run.call_args_list[1].args[0])
+        self.assertIn("--audio", run.call_args_list[1].args[0])
+
+    def test_diarizer_keeps_library_logs_out_of_json_stdout(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def noisy_diarize(*_: object) -> dict[str, object]:
+            print("library notice")
+            return {
+                "segments": [
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "speaker": 0,
+                        "confidence": 0.9,
+                        "margin": 0.8,
+                    }
+                ],
+                "details": {"backend": "3dspeaker-offline"},
+            }
+
+        arguments = [
+            "diarization_3dspeaker.py",
+            "diarize",
+            "--manifest",
+            "manifest.json",
+            "--source-dir",
+            "source",
+            "--models-dir",
+            "models",
+            "--audio",
+            "audio.wav",
+            "--speaker-count",
+            "2",
+        ]
+        with mock.patch.object(sys, "argv", arguments), mock.patch.object(
+            diarization_3dspeaker, "_load_manifest", return_value={}
+        ), mock.patch.object(
+            diarization_3dspeaker, "diarize", side_effect=noisy_diarize
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = diarization_3dspeaker.main()
+
+        self.assertEqual(result, 0)
+        self.assertIn("library notice", stderr.getvalue())
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["details"]["backend"], "3dspeaker-offline")
+
+    def test_offline_command_preserves_virtualenv_python_symlink(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="personal-context-offline-python-") as temporary:
+            base = Path(temporary)
+            real_python = base / "python-3.12"
+            real_python.write_text("synthetic interpreter", encoding="utf-8")
+            venv_python = base / "venv" / "bin" / "python"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.symlink_to(real_python)
+
+            command = qwen_mlx._build_offline_command(
+                str(venv_python),
+                str(base / "diarizer.py"),
+                str(base / "manifest.json"),
+                str(base / "source"),
+                str(base / "models"),
+            )
+
+        self.assertEqual(command[0], str(venv_python.absolute()))
+        self.assertNotEqual(command[0], str(real_python.resolve()))
+
     def test_cluster_evidence_exposes_only_anonymous_scalar_scores(self) -> None:
         chunks = [[0.0, 1.5], [0.75, 2.25], [2.25, 3.75], [3.0, 4.5]]
         labels = [0, 0, 1, 1]
@@ -248,6 +565,55 @@ class OfflineBackendCacheTests(unittest.TestCase):
 
 
 class ExperimentalProviderPlanTests(unittest.TestCase):
+    def test_experimental_profile_enables_only_conservative_sentence_tail_absorption(
+        self,
+    ) -> None:
+        settings = onboarding.load_manifest("qwen-mlx-3dspeaker")["word_assembly"]
+
+        self.assertFalse(settings["boundary_realign_enabled"])
+        self.assertTrue(settings["sentence_tail_absorption_enabled"])
+        self.assertEqual(settings["sentence_tail_max_characters"], 4)
+        self.assertEqual(settings["sentence_tail_max_seconds"], 0.8)
+        self.assertIn("操", settings["sentence_tail_protected_responses"])
+        self.assertIn("我操", settings["sentence_tail_protected_responses"])
+
+    def test_macos_runtime_pins_only_required_modelscope_audio_stack(self) -> None:
+        packages = onboarding.load_manifest("qwen-mlx-3dspeaker")["runtime"][
+            "packages"
+        ]
+
+        self.assertIn("modelscope[framework]==1.39.0", packages)
+        self.assertIn("funasr==1.4.2", packages)
+        self.assertIn("PyYAML==6.0.2", packages)
+        self.assertIn("tqdm==4.67.1", packages)
+        self.assertFalse(
+            any(package.startswith("modelscope[audio]") for package in packages)
+        )
+
+    def test_word_assembly_change_does_not_invalidate_offline_runtime(self) -> None:
+        manifest = onboarding.load_manifest("qwen-mlx-3dspeaker")
+        changed = copy.deepcopy(manifest)
+        changed["word_assembly"]["sentence_tail_max_characters"] += 1
+
+        self.assertEqual(
+            onboarding.offline_runtime_digest(manifest),
+            onboarding.offline_runtime_digest(changed),
+        )
+        self.assertNotEqual(
+            onboarding.manifest_digest(manifest),
+            onboarding.manifest_digest(changed),
+        )
+
+    def test_runtime_package_change_invalidates_offline_runtime(self) -> None:
+        manifest = onboarding.load_manifest("qwen-mlx-3dspeaker")
+        changed = copy.deepcopy(manifest)
+        changed["runtime"]["packages"] = [*changed["runtime"]["packages"], "example==1.0"]
+
+        self.assertNotEqual(
+            onboarding.offline_runtime_digest(manifest),
+            onboarding.offline_runtime_digest(changed),
+        )
+
     def test_experimental_provider_is_explicit_and_auto_default_does_not_change(self) -> None:
         self.assertEqual(onboarding.select_provider("auto"), "qwen-mlx")
         self.assertEqual(

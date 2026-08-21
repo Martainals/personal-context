@@ -68,6 +68,27 @@ def manifest_digest(manifest: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(identity).encode("utf-8")).hexdigest()
 
 
+def offline_runtime_digest(manifest: dict[str, Any]) -> str:
+    """Hash only the fields that determine the private 3D-Speaker runtime."""
+    identity = {
+        "provider": manifest["provider"],
+        "runtime": manifest["runtime"],
+        "source": {
+            "repo": manifest["source"]["repo"],
+            "revision": manifest["source"]["revision"],
+        },
+        "models": {
+            role: {
+                key: model[key]
+                for key in ("repo_id", "revision", "checkpoint")
+                if key in model
+            }
+            for role, model in manifest["models"].items()
+        },
+    }
+    return hashlib.sha256(canonical_json(identity).encode("utf-8")).hexdigest()
+
+
 def notice_digest() -> str:
     return hashlib.sha256(canonical_json(NOTICE).encode("utf-8")).hexdigest()
 
@@ -315,13 +336,31 @@ def _offline_diarization_status(config_dir: Path) -> dict[str, Any]:
             }
         )
     marker = _read_json(runtime / "runtime.json")
-    digest = manifest_digest(manifest)
+    digest = offline_runtime_digest(manifest)
+    legacy_runtime_matches = bool(
+        marker
+        and marker.get("python") == manifest["runtime"]["python"]
+        and marker.get("packages") == manifest["runtime"]["packages"]
+        and marker.get("source_revision") == manifest["source"]["revision"]
+        and all(
+            item["present"]
+            and Path(str(item["path"])).name == manifest["models"][item["role"]]["revision"]
+            and manifest["models"][item["role"]]["repo_id"].replace("/", "--")
+            in str(item["path"])
+            for item in models
+        )
+    )
     marker_current = bool(
         marker
         and marker.get("provider") == "qwen-mlx-3dspeaker"
-        and marker.get("profile_version") == manifest.get("profile_version")
-        and marker.get("manifest_digest") == digest
         and marker.get("source_revision") == manifest["source"]["revision"]
+        and (
+            marker.get("runtime_digest") == digest
+            or (
+                marker.get("runtime_digest") is None
+                and legacy_runtime_matches
+            )
+        )
     )
     installed = bool(
         python_path.is_file()
@@ -942,6 +981,7 @@ def install_3dspeaker_runtime(config_dir: Path) -> dict[str, Any]:
         "provider": "qwen-mlx-3dspeaker",
         "profile_version": manifest["profile_version"],
         "manifest_digest": manifest_digest(manifest),
+        "runtime_digest": offline_runtime_digest(manifest),
         "source_revision": manifest["source"]["revision"],
         "installed_at": utc_now(),
         "python": manifest["runtime"]["python"],

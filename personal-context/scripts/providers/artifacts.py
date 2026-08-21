@@ -81,6 +81,11 @@ def _validate_payload(value: Any, path: tuple[str, ...] = ()) -> None:
     raise ValueError(f"Artifact payload is not JSON-compatible: {type(value).__name__}")
 
 
+def validate_artifact_payload(value: Any) -> None:
+    """Validate a prospective artifact before starting expensive work."""
+    _validate_payload(value)
+
+
 @dataclass(frozen=True)
 class ArtifactResult:
     status: str
