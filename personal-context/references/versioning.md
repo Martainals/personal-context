@@ -2,7 +2,7 @@
 
 Skill version and database Schema version are independent:
 
-- Skill version: `VERSION` (`0.7.1`)
+- Skill version: `VERSION` (`0.8.0`)
 - Current Schema: `1`
 - Minimum supported Schema: `1`
 - Maximum supported Schema: `1`
@@ -29,6 +29,8 @@ Skill 0.6.0 restores punctuation already produced by ASR after forced alignment,
 Skill 0.7.0 adds the explicit experimental `qwen-mlx-3dspeaker` profile. It keeps the locked Qwen ASR and aligner, places 3D-Speaker/Torch in a separate runtime, persists only anonymous turns and scalar cluster-distance evidence, and keys the offline diarization stage independently from ASR and alignment. First-use planning lists both private environments on a fresh machine and only the missing diarizer for an existing current Qwen installation; interrupted installation is resumable and cannot report ready before every locked component passes status checks. The default `auto` choice and qwen-mlx profile 3 remain unchanged; existing qwen-mlx receipts and runtimes therefore remain valid. Selecting the experimental Provider changes the provider/profile digest and requires a new plan, explicit consent and installation. Schema 1, Provider/transcript contract 1, Artifact contract 1 and Consent Notice 2 remain unchanged.
 
 Skill 0.7.1 upgrades `qwen-mlx` to profile 4 and adds a conservative ASR recovery policy. A normal 240-second chunk retains its profile-3 component identity and remains reusable. A chunk dominated by a catastrophic repeated-character run is regenerated as 30-second slices, checked again, aligned slice by slice and stored under a distinct recovery key. A still-pathological smaller slice fails before publication. Existing diarization and valid ASR/alignment sibling chunks remain reusable. Model revisions, runtime packages, Schema 1, provider/transcript contract 1, Artifact contract 1 and Consent Notice 2 remain unchanged, so no model download or database migration is required; the changed Provider profile requires a renewed bootstrap plan, consent receipt and runtime marker.
+
+Skill 0.8.0 adds a host-neutral semantic speaker review protocol in consented `agent-assisted` mode. The Provider creates private six-minute review windows from the unchanged cached assembly plus recording-local confidence; the Agent can return only medium/high-confidence assignments to speakers already present in that recording. A local validator binds decisions to the audio and review-input hashes and preserves every segment's text, timestamps, order and count. Review files are transient rather than a new artifact stage, and final delivery still uses the existing single Markdown renderer. `strict-local` rejects the review options. Schema 1, Provider/transcript contract 1, Artifact contract 1, both provider profiles, model/runtime locks and Consent Notice 2 remain unchanged, so existing databases, models, caches and valid consent receipts need no migration or reinstall.
 
 ## Compatibility behavior
 

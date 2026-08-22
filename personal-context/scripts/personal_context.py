@@ -1134,6 +1134,7 @@ def capture_audio(
     title: Optional[str],
     observed_at: Optional[str],
     speaker_count: Optional[int] = None,
+    speaker_review_decisions: Optional[Path] = None,
     rerun: bool = False,
     check_only: bool = False,
 ) -> dict[str, Any]:
@@ -1243,6 +1244,7 @@ def capture_audio(
             title=effective_title,
             observed_at=effective_observed_at,
             speaker_count=speaker_count,
+            speaker_review_decisions=speaker_review_decisions,
         )
         if not transcript_path.is_file():
             raise ContextError("Transcription completed without private transcript.v1 output.")
@@ -1294,8 +1296,9 @@ def capture_audio(
         "markdown": markdown,
         "provider": transcribe_result.get("provider"),
         "cache": transcribe_result.get("cache"),
+        "speaker_review": transcribe_result.get("speaker_review"),
         "mode": transcribe_result.get("mode"),
-        "text_exposed_to_agent": False,
+        "text_exposed_to_agent": bool(transcribe_result.get("text_exposed_to_agent")),
     }
 
 
@@ -1983,6 +1986,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     command.add_argument("--title")
     command.add_argument("--observed-at", help="Optional ISO-8601 event observation time.")
+    command.add_argument(
+        "--speaker-review-output",
+        help="Private path for an Agent-readable semantic speaker review input; agent-assisted mode only.",
+    )
+    command.add_argument(
+        "--speaker-review-decisions",
+        help="Private semantic speaker decisions to validate and apply; agent-assisted mode only.",
+    )
     command.add_argument("--no-cache", action="store_true", help="Bypass transcription cache reads and writes for this run.")
     command.add_argument(
         "--refresh-stage",
@@ -2006,6 +2017,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     command.add_argument("--title")
     command.add_argument("--observed-at", help="Optional ISO-8601 event observation time.")
+    command.add_argument(
+        "--speaker-review-decisions",
+        help="Private semantic speaker decisions to validate before publishing the one Markdown delivery.",
+    )
     command.add_argument(
         "--rerun",
         action="store_true",
@@ -2163,6 +2178,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 speaker_count=args.speaker_count,
                 no_cache=args.no_cache,
                 refresh_stage=args.refresh_stage,
+                speaker_review_output=(
+                    Path(args.speaker_review_output)
+                    if args.speaker_review_output
+                    else None
+                ),
+                speaker_review_decisions=(
+                    Path(args.speaker_review_decisions)
+                    if args.speaker_review_decisions
+                    else None
+                ),
             )
         elif args.command == "capture-audio":
             result = capture_audio(
@@ -2175,6 +2200,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 title=args.title,
                 observed_at=args.observed_at,
                 speaker_count=args.speaker_count,
+                speaker_review_decisions=(
+                    Path(args.speaker_review_decisions)
+                    if args.speaker_review_decisions
+                    else None
+                ),
                 rerun=args.rerun,
                 check_only=args.check_only,
             )

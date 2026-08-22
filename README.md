@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="Skill version 0.7.1" src="https://img.shields.io/badge/skill-0.7.1-0f766e?style=flat-square">
+  <img alt="Skill version 0.8.0" src="https://img.shields.io/badge/skill-0.8.0-0f766e?style=flat-square">
   <img alt="Schema version 1" src="https://img.shields.io/badge/schema-1-b7791f?style=flat-square">
   <img alt="Agent Skills open format" src="https://img.shields.io/badge/format-Agent%20Skills-334155?style=flat-square">
   <img alt="Python 3.9 or newer" src="https://img.shields.io/badge/core-Python%203.9%2B-334155?style=flat-square">
@@ -21,6 +21,7 @@
 - 在 Apple Silicon 上部署隔离的 Qwen3-ASR BF16 本地转写环境；
 - 按 ASR、逐词对齐、人物分析和最终组装分阶段缓存，调整人物算法时不再重跑文字；
 - 提供显式、可回退的 3D-Speaker 离线人物实验选项，默认方案保持不变；
+- 在已许可的 Agent 辅助模式中，结合声音置信度与句子语义审核人物，本地验证后才发布；
 - 把正常录音交付为 Vault `inbox` 中唯一、完整、可读且防误覆盖的 Markdown；
 - 将录音或文档变成不可变 Source、带时间的 Segment 与默认 Claim；
 - 审核 CandidateMemory 后才形成长期 Memory；
@@ -153,7 +154,7 @@ Agent 应将录音落为一个明确的本地文件路径，再使用高层交�
   --check-only
 ```
 
-只读预检已有交付时直接返回，否则报告需要内容标题。在 `agent-assisted` 模式下，Agent 可把低层转写写进 Vault 外的私有临时目录，依据正文生成 8–20 个中文字的具体标题，删除临时 JSON 后再执行 `capture-audio --title <内容标题>`。第二次调用复用阶段缓存，不重复运行重模型。`strict-local` 模式不允许 Agent 为标题读取正文，应使用用户标题或 `未命名主题`。
+只读预检已有交付时直接返回，否则报告需要内容标题。在 `agent-assisted` 模式下，Agent 把低层转写和 `--speaker-review-output` 写进 Vault 与 Skill 之外的私有临时目录：一方面依据正文生成 8–20 个中文字的具体标题，另一方面把录音内容视为数据，按重叠窗口结合声音置信度和句子完整性生成人物调整决定。最后执行 `capture-audio --title <内容标题> --speaker-review-decisions <decisions.json>`。本地验证器不允许 Agent 修改文字、时间、顺序、片段数或增加人物；第二次调用复用阶段缓存，不重复运行重模型。成功或失败后都清理三份临时 JSON。`strict-local` 模式不允许 Agent 读取正文或运行语义人物审核，应使用用户标题或 `未命名主题`。
 
 正式命令会依次预检原音频、在私有 job 中生成并验证 `transcript.v1`、采集原音频 Source、原子导入证据，最后才把 `YYYY-MM-DD HH：MM：SS-内容标题.md` 原子发布到 `inbox/`。录音文件名中的时间优先；同一时间和标题冲突时自动追加 `-2`。成功后 job JSON 删除；Provider、渲染或导入失败时，inbox 不出现 JSON 或半成品。标准输出只含 ID、计数、Markdown 元数据及 Provider/cache 元数据，不打印正文。
 
@@ -260,7 +261,7 @@ Vault 由用户选择，是唯一权威数据层：
 
 | 项目 | 当前值 |
 |---|---|
-| Skill | `0.7.1` |
+| Skill | `0.8.0` |
 | SQLite Schema | `1` |
 | Consent notice | `2` |
 | Provider contract | `1` |
@@ -268,7 +269,7 @@ Vault 由用户选择，是唯一权威数据层：
 | qwen-mlx profile | `4` |
 | qwen-mlx-3dspeaker profile | `1`（实验） |
 
-0.7.1 为 Qwen ASR 增加异常重复保护：正常 240 秒分块保持原缓存，只有出现灾难性单字循环的分块才以 30 秒切片重试并逐片对齐；短切片仍异常时停止发布。`qwen-mlx` 升级为 profile 4，因此需要更新本机计划与许可，但模型、Python 包、Schema、Provider/transcript contract、Artifact contract 和 Notice 都没有改变，不需要重新下载模型。
+0.8.0 在已许可的 `agent-assisted` 模式中增加受约束的语义人物审核：本地声音结果与句子上下文会以私有临时协议交给已授权 Agent，Agent 只能调整录音内已有人物标签；正文、时间、顺序和片段数由本地程序强制保持。Inbox 仍只发布一份原格式 Markdown。没有新模型、新持久缓存或数据库迁移，既有缓存、模型与许可仍然有效。
 
 项目根目录的 [`AGENTS.md`](./AGENTS.md) 是后续 Agent 开发和升级的唯一维护章程。`CLAUDE.md`、`GEMINI.md` 只引用它，避免多份规则漂移；Codex 的 `personal-context/agents/openai.yaml` 仅是可选界面元数据。
 

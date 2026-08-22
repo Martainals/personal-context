@@ -21,6 +21,7 @@ PROVIDERS = REPO_ROOT / "personal-context" / "scripts" / "providers"
 sys.path.insert(0, str(PROVIDERS))
 
 import qwen_mlx  # noqa: E402
+import semantic_speaker_review  # noqa: E402
 
 SCRIPTS = REPO_ROOT / "personal-context" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -432,6 +433,114 @@ class ProviderStageCacheTests(unittest.TestCase):
             )
         self.assertEqual(counters, cold_counts)
         self.assertEqual(json.loads(changed.read_text(encoding="utf-8"))["event"]["title"], "改变标题")
+
+    def test_semantic_speaker_review_reuses_heavy_cache_and_preserves_transcript_shape(self) -> None:
+        counters = {
+            "asr_load": 0,
+            "alignment_load": 0,
+            "diarization_load": 0,
+            "asr_generate": 0,
+            "alignment_generate": 0,
+            "diarization_generate": 0,
+        }
+
+        def fake_audio(_: Path) -> tuple[list[float], int]:
+            return [0.1] * 16000, 16000
+
+        def fake_wav(path: Path, samples: object, sample_rate: int = 16000) -> None:
+            del samples, sample_rate
+            path.write_bytes(b"normalized")
+
+        base_output = self.base / "semantic-base.json"
+        review_input_path = self.base / "semantic-review-input.json"
+        decisions_path = self.base / "semantic-review-decisions.json"
+        reviewed_output = self.base / "semantic-reviewed.json"
+        modules = self._fake_model_modules(counters)
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(
+            qwen_mlx, "_to_mono_16k", side_effect=fake_audio
+        ), mock.patch.object(qwen_mlx, "_write_wav", side_effect=fake_wav):
+            qwen_mlx.transcribe(
+                copy.deepcopy(self.manifest),
+                self.models_dir,
+                self.audio,
+                base_output,
+                language="Chinese",
+                title="固定标题",
+                observed_at="2026-08-16T10:00:00Z",
+                speaker_count=2,
+                artifacts_dir=self.artifacts_dir,
+                vault_scope=self.scope,
+                speaker_review_output=review_input_path,
+            )
+            cold_counts = dict(counters)
+            review_input = json.loads(review_input_path.read_text(encoding="utf-8"))
+            unit = next(
+                item
+                for item in review_input["units"]
+                if not item["question"] and not item["short_response"]
+            )
+            target = "S02" if unit["acoustic_speaker"] == "S01" else "S01"
+            decisions_path.write_text(
+                json.dumps(
+                    {
+                        "contract": semantic_speaker_review.REVIEW_DECISIONS_CONTRACT,
+                        "audio_sha256": review_input["audio_sha256"],
+                        "input_sha256": review_input["input_sha256"],
+                        "reviewer": {
+                            "host": "synthetic-agent",
+                            "strategy": "sound-and-semantics-v1",
+                        },
+                        "operations": [
+                            {
+                                "action": "assign_speaker",
+                                "unit_id": unit["unit_id"],
+                                "speaker": target,
+                                "reason": "joint-sound-and-semantics",
+                                "confidence": "high",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            result = qwen_mlx.transcribe(
+                copy.deepcopy(self.manifest),
+                self.models_dir,
+                self.audio,
+                reviewed_output,
+                language="Chinese",
+                title="固定标题",
+                observed_at="2026-08-16T10:00:00Z",
+                speaker_count=2,
+                artifacts_dir=self.artifacts_dir,
+                vault_scope=self.scope,
+                speaker_review_decisions=decisions_path,
+            )
+
+        base = json.loads(base_output.read_text(encoding="utf-8"))
+        reviewed = json.loads(reviewed_output.read_text(encoding="utf-8"))
+        self.assertEqual(counters, cold_counts)
+        self.assertEqual(len(reviewed["segments"]), len(base["segments"]))
+        self.assertEqual(
+            [
+                (item["start_ms"], item["end_ms"], item["text"])
+                for item in reviewed["segments"]
+            ],
+            [
+                (item["start_ms"], item["end_ms"], item["text"])
+                for item in base["segments"]
+            ],
+        )
+        self.assertNotEqual(
+            [item["speaker"] for item in reviewed["segments"]],
+            [item["speaker"] for item in base["segments"]],
+        )
+        self.assertTrue(result["speaker_review"]["applied"])
+        self.assertEqual(
+            reviewed["processing"]["semantic_speaker_review"]["accepted_operations"],
+            1,
+        )
 
     def test_language_and_model_revisions_invalidate_only_their_components(self) -> None:
         cases = (

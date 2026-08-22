@@ -503,6 +503,152 @@ class PersonalContextTests(unittest.TestCase):
         self.assertIn("--refresh-stage", commands[0])
         self.assertEqual(commands[0][commands[0].index("--refresh-stage") + 1], "alignment")
 
+    def test_agent_assisted_transcription_can_prepare_private_speaker_review(self) -> None:
+        audio = self.base / "agent assisted recording.m4a"
+        audio.write_bytes(b"synthetic-agent-assisted-audio")
+        output = self.base / "agent assisted transcript.json"
+        review_output = self.base / "agent assisted speaker review.json"
+        compatible = {
+            "system": "Darwin",
+            "machine": "arm64",
+            "python": "3.9.0",
+            "qwen_mlx_compatible": True,
+            "qwen_mlx_reason": None,
+        }
+        with mock.patch.object(onboarding, "platform_probe", return_value=compatible):
+            onboarding.record_consent(
+                self.root,
+                config_dir=self.config_dir,
+                mode="agent-assisted",
+                provider="qwen-mlx",
+                agent_host="codex",
+                accepted_digest=onboarding.consent_scope_digest(
+                    self.root,
+                    provider="qwen-mlx",
+                    mode="agent-assisted",
+                    agent_host="codex",
+                ),
+            )
+
+        commands: list[list[str]] = []
+
+        def fake_run(
+            command: list[str], *, env: Optional[dict[str, str]] = None
+        ) -> subprocess.CompletedProcess[str]:
+            del env
+            commands.append(command)
+            output.write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {
+                                "start_ms": 0,
+                                "end_ms": 1000,
+                                "speaker": "S01",
+                                "text": "只应存在于私有审核输入。",
+                            }
+                        ],
+                        "processing": {
+                            "provider": "qwen-mlx",
+                            "source_audio_sha256": file_hash(audio),
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            review_output.write_text(
+                json.dumps({"contract": "semantic-speaker-review-input.v1"}),
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "status": "transcribed",
+                        "cache": {"enabled": True, "hits": 5, "computed": 0},
+                        "speaker_review": {
+                            "prepared": True,
+                            "applied": False,
+                            "input_sha256": "a" * 64,
+                            "accepted_operations": 0,
+                        },
+                    }
+                ),
+                stderr="",
+            )
+
+        ready = {"provider": "qwen-mlx", "compatible": True, "installed": True, "ready": True}
+        with mock.patch.object(onboarding, "provider_status", return_value=ready), mock.patch.object(
+            onboarding, "_run_checked", side_effect=fake_run
+        ):
+            result = onboarding.transcribe_audio(
+                self.root,
+                config_dir=self.config_dir,
+                provider="auto",
+                agent_host="codex",
+                audio=audio,
+                output=output,
+                language="Chinese",
+                title=None,
+                observed_at=None,
+                speaker_count=2,
+                speaker_review_output=review_output,
+            )
+
+        rendered = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("只应存在于私有审核输入", rendered)
+        self.assertTrue(result["text_exposed_to_agent"])
+        self.assertTrue(result["speaker_review"]["prepared"])
+        self.assertIn("--speaker-review-output", commands[0])
+        self.assertEqual(
+            commands[0][commands[0].index("--speaker-review-output") + 1],
+            str(review_output.resolve()),
+        )
+
+    def test_strict_local_mode_refuses_semantic_speaker_review_files(self) -> None:
+        audio = self.base / "strict local recording.m4a"
+        audio.write_bytes(b"synthetic-strict-local-audio")
+        output = self.base / "strict transcript.json"
+        review_output = self.base / "forbidden review.json"
+        compatible = {
+            "system": "Darwin",
+            "machine": "arm64",
+            "python": "3.9.0",
+            "qwen_mlx_compatible": True,
+            "qwen_mlx_reason": None,
+        }
+        with mock.patch.object(onboarding, "platform_probe", return_value=compatible):
+            onboarding.record_consent(
+                self.root,
+                config_dir=self.config_dir,
+                mode="strict-local",
+                provider="qwen-mlx",
+                agent_host="codex",
+                accepted_digest=onboarding.consent_scope_digest(
+                    self.root,
+                    provider="qwen-mlx",
+                    mode="strict-local",
+                    agent_host="codex",
+                ),
+            )
+
+        with self.assertRaises(onboarding.BootstrapError):
+            onboarding.transcribe_audio(
+                self.root,
+                config_dir=self.config_dir,
+                provider="auto",
+                agent_host="codex",
+                audio=audio,
+                output=output,
+                language="Chinese",
+                title=None,
+                observed_at=None,
+                speaker_review_output=review_output,
+            )
+        self.assertFalse(review_output.exists())
+
     def test_qwen_provider_profile_is_locked_and_lazy_loads_optional_dependencies(self) -> None:
         manifest = onboarding.load_manifest()
         self.assertEqual(manifest["provider"], "qwen-mlx")
@@ -531,7 +677,7 @@ class PersonalContextTests(unittest.TestCase):
 
     def test_release_versions_keep_schema_and_transcript_contract_stable(self) -> None:
         versions = pc.version_info(None)
-        self.assertEqual(versions["skill_version"], "0.7.1")
+        self.assertEqual(versions["skill_version"], "0.8.0")
         self.assertEqual(versions["schema_version"], 1)
         self.assertEqual(versions["provider_contract_version"], 1)
         self.assertEqual(versions["artifact_contract_version"], 1)

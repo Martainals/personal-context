@@ -1088,12 +1088,20 @@ def transcribe_audio(
     speaker_count: Optional[int] = None,
     no_cache: bool = False,
     refresh_stage: Optional[str] = None,
+    speaker_review_output: Optional[Path] = None,
+    speaker_review_decisions: Optional[Path] = None,
 ) -> dict[str, Any]:
     receipt = _read_json(_receipt_path(root, config_dir))
     selected = _select_with_receipt(provider, receipt)
     consent_ok, reason = _receipt_matches(receipt, root=root, provider=selected, agent_host=agent_host)
     if not consent_ok:
         raise BootstrapError(f"Valid consent is required before transcription: {reason}")
+    if (speaker_review_output is not None or speaker_review_decisions is not None) and receipt.get(
+        "mode"
+    ) != "agent-assisted":
+        raise BootstrapError(
+            "Semantic speaker review requires consented agent-assisted mode."
+        )
     if selected == "transcript-only":
         raise BootstrapError("transcript-only cannot transcribe audio; import an existing transcript instead.")
     status = provider_status(selected, config_dir)
@@ -1104,6 +1112,37 @@ def transcribe_audio(
         raise BootstrapError(f"Audio file not found: {audio_path}")
     output_path = output.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    root_path = root.expanduser().resolve()
+    review_output_path = (
+        speaker_review_output.expanduser().resolve()
+        if speaker_review_output is not None
+        else None
+    )
+    review_decisions_path = (
+        speaker_review_decisions.expanduser().resolve()
+        if speaker_review_decisions is not None
+        else None
+    )
+    selected_paths = [
+        path
+        for path in (output_path, review_output_path, review_decisions_path)
+        if path is not None
+    ]
+    if len(set(selected_paths)) != len(selected_paths):
+        raise BootstrapError(
+            "Transcript, semantic review input, and review decisions must use different paths."
+        )
+    for review_path in (review_output_path, review_decisions_path):
+        if review_path is None:
+            continue
+        try:
+            review_path.relative_to(root_path)
+        except ValueError:
+            pass
+        else:
+            raise BootstrapError(
+                "Semantic speaker review files must stay outside the selected Vault."
+            )
     runtime = runtime_dir(config_dir)
     manifest_path = Path(__file__).resolve().parent.parent / "assets" / "providers" / "qwen-mlx.lock.json"
     command = [
@@ -1161,6 +1200,27 @@ def transcribe_audio(
         command.extend(["--title", title])
     if observed_at:
         command.extend(["--observed-at", observed_at])
+    if review_output_path is not None:
+        command.extend(["--speaker-review-output", str(review_output_path)])
+    if review_decisions_path is not None:
+        if not review_decisions_path.is_file():
+            raise BootstrapError(
+                f"Semantic speaker review decisions not found: {review_decisions_path}"
+            )
+        try:
+            decision_metadata = json.loads(
+                review_decisions_path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise BootstrapError(
+                f"Semantic speaker review decisions are not valid UTF-8 JSON: {exc}"
+            ) from exc
+        reviewer = decision_metadata.get("reviewer") if isinstance(decision_metadata, dict) else None
+        if not isinstance(reviewer, dict) or reviewer.get("host") != receipt.get("agent_host"):
+            raise BootstrapError(
+                "Semantic speaker review decisions must name the consented agent host."
+            )
+        command.extend(["--speaker-review-decisions", str(review_decisions_path)])
     if no_cache:
         command.append("--no-cache")
     if refresh_stage is not None:
@@ -1184,6 +1244,18 @@ def transcribe_audio(
         if not isinstance(parsed_operation, dict):
             raise BootstrapError("Provider operation metadata must be a JSON object.")
         provider_operation = parsed_operation
+    speaker_review_operation = provider_operation.get("speaker_review")
+    if review_output_path is not None and not review_output_path.is_file():
+        raise BootstrapError(
+            "Transcription provider completed without producing semantic speaker review input."
+        )
+    if review_decisions_path is not None and (
+        not isinstance(speaker_review_operation, dict)
+        or speaker_review_operation.get("applied") is not True
+    ):
+        raise BootstrapError(
+            "Transcription provider did not confirm semantic speaker review application."
+        )
     if not output_path.is_file():
         raise BootstrapError("Transcription provider completed without producing the requested output.")
     try:
@@ -1209,6 +1281,7 @@ def transcribe_audio(
         "bytes": output_path.stat().st_size,
         "segments": len(segments),
         "cache": provider_operation.get("cache"),
+        "speaker_review": speaker_review_operation,
         "text_exposed_to_agent": receipt.get("mode") == "agent-assisted",
     }
 

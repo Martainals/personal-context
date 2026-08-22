@@ -239,6 +239,45 @@ class CaptureAudioTests(unittest.TestCase):
             )
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0], 0)
 
+    def test_semantic_review_still_publishes_only_the_existing_markdown_format(self) -> None:
+        decisions = self.base / "private-review-decisions.json"
+        decisions.write_text("{}", encoding="utf-8")
+
+        def reviewed_transcribe(root: Path, **kwargs: Any) -> dict[str, Any]:
+            self.assertEqual(Path(kwargs["speaker_review_decisions"]), decisions)
+            result = self._fake_transcribe(root, **kwargs)
+            result["mode"] = "agent-assisted"
+            result["text_exposed_to_agent"] = True
+            result["speaker_review"] = {"prepared": False, "applied": True}
+            return result
+
+        with mock.patch.object(
+            onboarding, "transcribe_audio", side_effect=reviewed_transcribe
+        ):
+            result = pc.capture_audio(
+                self.root,
+                config_dir=self.config,
+                provider="qwen-mlx",
+                agent_host="codex",
+                audio=self.audio,
+                language="Chinese",
+                title="语义与声音联合测试",
+                observed_at=None,
+                speaker_count=2,
+                speaker_review_decisions=decisions,
+            )
+
+        inbox_files = list((self.root / "inbox").iterdir())
+        self.assertEqual(len(inbox_files), 1)
+        self.assertEqual(inbox_files[0].suffix, ".md")
+        markdown = inbox_files[0].read_text(encoding="utf-8")
+        self.assertIn("状态：完整转写", markdown)
+        self.assertIn("00:00:00 · S01", markdown)
+        self.assertNotIn("semantic-speaker-review", markdown)
+        self.assertTrue(decisions.is_file())
+        self.assertTrue(result["speaker_review"]["applied"])
+        self.assertTrue(result["text_exposed_to_agent"])
+
     def test_repeating_the_same_audio_returns_existing_delivery_without_provider(self) -> None:
         results = []
         with mock.patch.object(

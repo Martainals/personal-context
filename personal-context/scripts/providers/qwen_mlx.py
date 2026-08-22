@@ -34,6 +34,13 @@ try:
         speaker_details,
         speaker_for,
     )
+    from .semantic_speaker_review import (
+        apply_decisions as apply_semantic_speaker_decisions,
+        build_review_input as build_semantic_speaker_review_input,
+        load_decisions as load_semantic_speaker_decisions,
+        validate_decisions as validate_semantic_speaker_decisions,
+        write_private_json as write_semantic_speaker_review_input,
+    )
 except ImportError:  # Direct execution from the providers directory.
     from artifacts import (
         ARTIFACT_CONTRACT_VERSION,
@@ -51,6 +58,13 @@ except ImportError:  # Direct execution from the providers directory.
         smooth_word_speakers,
         speaker_details,
         speaker_for,
+    )
+    from semantic_speaker_review import (
+        apply_decisions as apply_semantic_speaker_decisions,
+        build_review_input as build_semantic_speaker_review_input,
+        load_decisions as load_semantic_speaker_decisions,
+        validate_decisions as validate_semantic_speaker_decisions,
+        write_private_json as write_semantic_speaker_review_input,
     )
 
 
@@ -788,6 +802,8 @@ def transcribe(
     no_cache: bool = False,
     refresh_stage: Optional[str] = None,
     provider_name: Optional[str] = None,
+    speaker_review_output: Optional[Path] = None,
+    speaker_review_decisions: Optional[Path] = None,
     diarization_backend: Optional[dict[str, Any]] = None,
     offline_diarization_runner: Optional[
         Callable[[Path, Optional[int]], dict[str, Any]]
@@ -1207,6 +1223,35 @@ def transcribe(
             segments = assembly_payload["segments"]
     if not segments:
         raise RuntimeError("No speech was transcribed")
+    semantic_review = None
+    if speaker_review_output is not None or speaker_review_decisions is not None:
+        sound_evidence = []
+        for segment in segments:
+            _, confidence, margin = speaker_details(
+                int(segment["start_ms"]) / 1000.0,
+                int(segment["end_ms"]) / 1000.0,
+                diarization,
+            )
+            sound_evidence.append({"confidence": confidence, "margin": margin})
+        review_input = build_semantic_speaker_review_input(
+            audio_sha256=source_hash,
+            segments=segments,
+            speaker_count=speaker_count,
+            sound_evidence=sound_evidence,
+        )
+        if speaker_review_output is not None:
+            write_semantic_speaker_review_input(speaker_review_output, review_input)
+        if speaker_review_decisions is not None:
+            decisions = load_semantic_speaker_decisions(speaker_review_decisions)
+            accepted = validate_semantic_speaker_decisions(review_input, decisions)
+            segments = apply_semantic_speaker_decisions(review_input, decisions)
+            semantic_review = {
+                "contract": str(decisions["contract"]),
+                "input_sha256": str(review_input["input_sha256"]),
+                "reviewer": dict(decisions["reviewer"]),
+                "accepted_operations": len(accepted),
+                "text_timestamps_and_order_preserved": True,
+            }
     document = {
         "event": {
             "title": title or audio_path.stem,
@@ -1272,6 +1317,11 @@ def transcribe(
                 "chunk_indices": [item["chunk_index"] for item in asr_recoveries],
                 "reasons": [item["reason"] for item in asr_recoveries],
             },
+            **(
+                {"semantic_speaker_review": semantic_review}
+                if semantic_review is not None
+                else {}
+            ),
         },
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1295,6 +1345,20 @@ def transcribe(
             "hits": hits,
             "computed": len(cache_events) - hits,
             "events": cache_events,
+        },
+        "speaker_review": {
+            "prepared": speaker_review_output is not None,
+            "applied": semantic_review is not None,
+            "input_sha256": (
+                str(review_input["input_sha256"])
+                if speaker_review_output is not None or speaker_review_decisions is not None
+                else None
+            ),
+            "accepted_operations": (
+                int(semantic_review["accepted_operations"])
+                if semantic_review is not None
+                else 0
+            ),
         },
     }
 
@@ -1323,6 +1387,8 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--artifacts-dir")
     command.add_argument("--vault-scope")
     command.add_argument("--provider-name")
+    command.add_argument("--speaker-review-output")
+    command.add_argument("--speaker-review-decisions")
     command.add_argument("--diarization-manifest")
     command.add_argument("--offline-python")
     command.add_argument("--offline-script")
@@ -1390,6 +1456,16 @@ def main() -> int:
                 no_cache=args.no_cache,
                 refresh_stage=args.refresh_stage,
                 provider_name=args.provider_name,
+                speaker_review_output=(
+                    Path(args.speaker_review_output).resolve()
+                    if args.speaker_review_output
+                    else None
+                ),
+                speaker_review_decisions=(
+                    Path(args.speaker_review_decisions).resolve()
+                    if args.speaker_review_decisions
+                    else None
+                ),
                 diarization_backend=offline_manifest,
                 offline_diarization_runner=offline_runner,
             )
