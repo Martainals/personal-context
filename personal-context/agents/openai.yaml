@@ -1,4 +1,4 @@
 interface:
   display_name: "个人上下文"
-  short_description: "安全采集录音，交付完整逐字稿并维护可追溯的个人上下文"
-  default_prompt: "使用 $personal-context 检查许可，并把我的本地录音安全采集为完整 Markdown 逐字稿。"
+  short_description: "安全交付录音逐字稿、可追溯笔记并维护个人上下文"
+  default_prompt: "使用 $personal-context 检查许可，并把我的本地录音安全整理为完整逐字稿；我明确要求时再生成对应笔记。"

@@ -28,12 +28,13 @@ The default Qwen/MLX runtime and experimental 3D-Speaker/Torch runtime are separ
 <root>/
 ├── context.sqlite3     # authoritative structured database
 ├── blobs/              # immutable, SHA-256-addressed Source bytes
-├── inbox/              # completed human-readable deliveries only
+├── inbox/              # complete transcript deliveries only
+├── notes/              # optional generated recording notes
 ├── wiki/               # generated human-readable view
 └── backups/            # migration backups
 ```
 
-The database and immutable Source blobs are authoritative. Title-based `inbox/*.md`, `wiki/`, and `search_index` are derived human-readable views. Normal audio capture never persists `transcript.v1` JSON in the Vault.
+The database and immutable Source blobs are authoritative. Title-based `inbox/*.md`, `notes/*.md`, `wiki/`, and `search_index` are derived human-readable views. Normal audio capture never persists `transcript.v1` JSON in the Vault. A new Vault creates `notes/`; an older Schema 1 Vault remains healthy without it until the first note publication creates it lazily.
 
 ## Pipeline
 
@@ -46,6 +47,7 @@ explicitly named audio
 → Statement / Entity / Decision / Action / Claim
 → CandidateMemory
 → atomic inbox Markdown publication → transient job cleanup
+→ optional explicit note request → private Agent draft → validated notes Markdown
 → explicit user review
 → approved Memory
 → compiled Wiki
@@ -53,6 +55,8 @@ explicitly named audio
 ```
 
 Capture and long-term memory formation are separate transactions and separate commands. Structured transcript import never approves memory.
+
+Note delivery is also separate from capture and memory formation. `publish-note` binds one private draft to an intact generated transcript, its Event, and the immutable audio Source. It publishes the note under the same filename in `notes/`, does not rerun the Provider, and creates neither CandidateMemory nor Memory.
 
 `capture-audio` orders work so Provider and Markdown validation happen before database writes, transcript import commits before inbox publication, and the job directory is removed on every exit. An import failure can leave only the already-verified immutable audio Source; it cannot leave a partial Event or inbox delivery. If final publication fails after import, stable IDs make a retry safe. A manually edited generated Markdown fails integrity preflight before Provider or database work and is never replaced.
 
@@ -65,7 +69,7 @@ An intact generated delivery with matching Source/Event evidence is a terminal d
 - Source content is copied to a content-addressed blob and verified before its database row is committed.
 - A transcript batch is validated before its transaction begins; all derived rows commit or roll back together.
 - Repeating the same file or transcript uses unique hashes and stable IDs, producing no duplicate logical records.
-- Markdown uses same-directory temporary files, `fsync`, atomic replacement, and a generated-body hash. Only an unedited generated file for the same audio hash can be updated.
+- Transcript and note Markdown use same-directory temporary files, `fsync`, atomic replacement, and generated-body hashes. A note is additionally bound to the exact transcript body hash. Only an intact generated file for the same evidence can be updated.
 - Bulk operations expose `--dry-run`; migrations require `--apply` after a default dry-run.
 
 ## Schema 1 limits

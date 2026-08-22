@@ -18,6 +18,13 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
+from note_markdown import (
+    ManualNoteEditError,
+    NoteMarkdownError,
+    generated_note_metadata,
+    publish_note_markdown,
+    render_note_markdown,
+)
 from transcript_markdown import (
     ManualEditError,
     TranscriptMarkdownError,
@@ -512,7 +519,7 @@ def init_vault(root: Path) -> dict[str, Any]:
         raise ContextError(f"Existing database is {state['status']}; refusing to initialize over it.")
     created_dirs: list[Path] = []
     try:
-        for relative in ("blobs", "inbox", "wiki", "backups"):
+        for relative in ("blobs", "inbox", "notes", "wiki", "backups"):
             directory = root / relative
             directory.mkdir(exist_ok=True)
             created_dirs.append(directory)
@@ -542,6 +549,17 @@ def doctor(root: Path) -> dict[str, Any]:
     checks.append({"name": "database", "ok": db_path(root).is_file(), "path": str(db_path(root))})
     for relative in ("blobs", "inbox", "wiki", "backups"):
         checks.append({"name": relative, "ok": (root / relative).is_dir(), "path": str(root / relative)})
+    notes_path = root / "notes"
+    checks.append(
+        {
+            "name": "notes",
+            "ok": not notes_path.exists()
+            or (notes_path.is_dir() and not notes_path.is_symlink()),
+            "path": str(notes_path),
+            "present": notes_path.is_dir() and not notes_path.is_symlink(),
+            "created_on_first_note": True,
+        }
+    )
     checks.append({"name": "schema", "ok": state["status"] == "current", **state})
     if db_path(root).exists() and state["status"] not in {"damaged", "unknown"}:
         try:
@@ -1302,6 +1320,155 @@ def capture_audio(
     }
 
 
+def _note_transcript_context(root: Path, transcript: Path) -> dict[str, Any]:
+    root = root.expanduser().resolve()
+    inbox_path = root / "inbox"
+    if inbox_path.is_symlink():
+        raise ContextError("Vault inbox must be a real directory, not a symbolic link.")
+    raw_transcript = transcript.expanduser().absolute()
+    if raw_transcript.is_symlink():
+        raise ContextError("Transcript delivery must be a real file, not a symbolic link.")
+    transcript_path = raw_transcript.resolve()
+    if transcript_path.parent != inbox_path.resolve() or transcript_path.suffix.lower() != ".md":
+        raise ContextError("Transcript delivery must be one Markdown file directly inside the selected Vault inbox.")
+    try:
+        identity = generated_markdown_identity(transcript_path)
+        if identity is None:
+            raise ContextError(f"Transcript delivery does not exist: {transcript_path}")
+        transcript_metadata = generated_markdown_metadata(
+            transcript_path,
+            source_audio_sha256=str(identity["source_audio_sha256"]),
+        )
+    except ManualEditError as exc:
+        raise ContextError(str(exc)) from exc
+    if transcript_metadata is None:
+        raise ContextError(f"Transcript delivery does not exist: {transcript_path}")
+
+    source_hash = str(identity["source_audio_sha256"])
+    with connect(root, readonly=True) as connection:
+        source = connection.execute(
+            "SELECT id, original_name, media_type, size_bytes, stored_path "
+            "FROM sources WHERE content_hash=?",
+            (source_hash,),
+        ).fetchone()
+    if source is None:
+        raise ContextError("Transcript audio Source is not present in the selected Vault.")
+    existing = _existing_delivery_record(
+        root,
+        source_id=str(source["id"]),
+        source_hash=source_hash,
+        segment_count=int(transcript_metadata["segments"]),
+        title=str(transcript_metadata["title"]) if transcript_metadata.get("title") else None,
+    )
+    if existing is None:
+        raise ContextError("Transcript delivery does not match an intact Event in the selected Vault.")
+    stored_audio_path = root / str(source["stored_path"])
+    if stored_audio_path.is_symlink():
+        raise ContextError("Transcript audio Source blob is missing or unsafe.")
+    audio_path = stored_audio_path.resolve()
+    try:
+        audio_path.relative_to(root)
+    except ValueError as exc:
+        raise ContextError("Transcript audio Source blob is outside the selected Vault.") from exc
+    if not audio_path.is_file():
+        raise ContextError("Transcript audio Source blob is missing or unsafe.")
+    return {
+        "source_id": str(source["id"]),
+        "event_id": str(existing["event_id"]),
+        "source_audio_sha256": source_hash,
+        "source_audio_path": str(audio_path),
+        "source_original_name": str(source["original_name"]),
+        "source_media_type": str(source["media_type"]),
+        "source_bytes": int(source["size_bytes"]),
+        "transcript": transcript_metadata,
+        "transcript_path": transcript_path,
+    }
+
+
+def publish_note(
+    root: Path,
+    *,
+    transcript: Path,
+    draft: Optional[Path],
+    rerun: bool = False,
+    check_only: bool = False,
+) -> dict[str, Any]:
+    """Publish one Agent-authored note beside its intact transcript delivery."""
+    root = root.expanduser().resolve()
+    require_writable(root)
+    context = _note_transcript_context(root, transcript)
+    notes_path = root / "notes"
+    if notes_path.is_symlink():
+        raise ContextError("Vault notes must be a real directory, not a symbolic link.")
+    if notes_path.exists() and not notes_path.is_dir():
+        raise ContextError("Vault notes path must be a directory.")
+    output_path = notes_path / Path(context["transcript_path"]).name
+    transcript_metadata = dict(context["transcript"])
+    try:
+        existing_note = generated_note_metadata(
+            output_path,
+            source_audio_sha256=str(context["source_audio_sha256"]),
+            transcript_body_sha256=str(transcript_metadata["body_sha256"]),
+        )
+    except ManualNoteEditError as exc:
+        raise ContextError(str(exc)) from exc
+
+    common = {
+        "source_id": context["source_id"],
+        "event_id": context["event_id"],
+        "source_audio": {
+            "path": context["source_audio_path"],
+            "original_name": context["source_original_name"],
+            "media_type": context["source_media_type"],
+            "bytes": context["source_bytes"],
+            "sha256": context["source_audio_sha256"],
+        },
+        "transcript": transcript_metadata,
+        "long_term_memory_created": False,
+    }
+    if existing_note is not None and not rerun:
+        return {"status": "already_delivered", **common, "note": existing_note}
+    if check_only:
+        return {
+            "status": "already_delivered" if existing_note is not None else "draft_required",
+            **common,
+            "note": existing_note
+            or {
+                "path": str(output_path.absolute()),
+                "title": transcript_metadata.get("title"),
+            },
+        }
+    if draft is None:
+        raise ContextError("A private Markdown note draft is required for publication.")
+    raw_draft = draft.expanduser().absolute()
+    if raw_draft.suffix.lower() != ".md" or raw_draft.is_symlink() or not raw_draft.is_file():
+        raise ContextError("Note draft must be one existing real Markdown file.")
+    draft_path = raw_draft.resolve()
+    try:
+        draft_path.relative_to(root)
+    except ValueError:
+        pass
+    else:
+        raise ContextError("Note draft must stay outside the Vault until validated publication.")
+    try:
+        draft_text = draft_path.read_text(encoding="utf-8")
+        rendered = render_note_markdown(
+            draft_text,
+            source_audio_sha256=str(context["source_audio_sha256"]),
+            transcript_body_sha256=str(transcript_metadata["body_sha256"]),
+        )
+        if rendered.title != transcript_metadata.get("title"):
+            raise NoteMarkdownError("Note H1 title must exactly match its transcript title")
+        note = publish_note_markdown(output_path, rendered)
+    except (OSError, UnicodeError, NoteMarkdownError) as exc:
+        raise ContextError(str(exc)) from exc
+    return {
+        "status": "republished" if existing_note is not None else "published",
+        **common,
+        "note": note,
+    }
+
+
 def _cache_hash_for_source(root: Path, source_id: str) -> str:
     with connect(root, readonly=True) as connection:
         row = connection.execute(
@@ -1478,6 +1645,7 @@ def storage_status(root: Path, *, config_dir: Path) -> dict[str, Any]:
         },
         "database": _filesystem_inventory(db_path(root)),
         "inbox": _filesystem_inventory(root / "inbox"),
+        "notes": _filesystem_inventory(root / "notes"),
         "transcription_cache": {
             "recordings": int(cache["recording_count"]),
             "artifacts": int(cache["valid_artifacts"]) + int(cache["corrupt_artifacts"]),
@@ -1912,6 +2080,7 @@ def version_info(root: Optional[Path]) -> dict[str, Any]:
         "max_supported_schema": MAX_SCHEMA_VERSION,
         "provider_contract_version": 1,
         "artifact_contract_version": 1,
+        "note_markdown_contract_version": 1,
         "consent_notice_version": 2,
         "qwen_mlx_profile_version": 4,
         "qwen_mlx_3dspeaker_profile_version": 1,
@@ -2030,6 +2199,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--check-only",
         action="store_true",
         help="Read-only preflight: return an existing delivery or report that a title is needed.",
+    )
+
+    command = subparsers.add_parser(
+        "publish-note",
+        help="Validate and publish one Agent-authored Markdown note to the Vault notes directory.",
+    )
+    _add_root(command)
+    command.add_argument(
+        "--transcript",
+        required=True,
+        help="Intact generated Markdown transcript directly inside the selected Vault inbox.",
+    )
+    command.add_argument(
+        "--draft",
+        help="Private Markdown note draft outside the Vault; required when publication is needed.",
+    )
+    note_mode = command.add_mutually_exclusive_group()
+    note_mode.add_argument(
+        "--rerun",
+        action="store_true",
+        help="Explicitly replace an intact generated note with a newly validated draft.",
+    )
+    note_mode.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Read-only preflight: return an intact note or the source metadata needed for a draft.",
     )
 
     command = subparsers.add_parser(
@@ -2205,6 +2400,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     if args.speaker_review_decisions
                     else None
                 ),
+                rerun=args.rerun,
+                check_only=args.check_only,
+            )
+        elif args.command == "publish-note":
+            result = publish_note(
+                root,
+                transcript=Path(args.transcript),
+                draft=Path(args.draft) if args.draft else None,
                 rerun=args.rerun,
                 check_only=args.check_only,
             )

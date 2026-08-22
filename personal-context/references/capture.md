@@ -41,6 +41,14 @@ Successful capture retains one immutable original audio Source in `blobs/`. It n
 
 Normal stdout contains only Source/Event IDs, counts, Markdown path/size/hashes, processing mode, Provider and cache metadata. It never contains transcript text. Speaker count is automatic unless the user explicitly supplies a 1–4 person hint. The workflow does not generate a summary or create/approve long-term Memory; the production audio Provider emits no CandidateMemory by default.
 
+## Derived recording notes
+
+`publish-note` is a separate, explicitly requested delivery step. It accepts only an intact generated Markdown transcript directly inside the selected Vault `inbox/`. Read-only `--check-only` verifies the transcript marker, its matching Event, and the immutable audio Source, then returns metadata without transcript text. It does not create `notes/` when no publication is needed.
+
+In consented `agent-assisted` mode, the Agent writes one complete Markdown draft to a private temporary path outside the Vault and Skill checkout. The draft H1 must exactly match the transcript title. The command binds the validated draft to both the source-audio hash and exact transcript-body hash, then atomically publishes `<vault>/notes/<same-transcript-filename>.md`. It copies neither the audio nor internal JSON into `notes/`, and creates no CandidateMemory or Memory.
+
+An intact matching note is a terminal default result. `--rerun` is required to replace it with a new draft. A manual body edit, missing integrity marker, different Source, changed transcript revision, unsafe symlink, or title mismatch stops publication without overwriting the existing file. Existing Schema 1 Vaults create `notes/` lazily on the first successful publication, so no database migration is required.
+
 ## Structured transcript JSON V1
 
 `import-transcript` requires no API key. It accepts UTF-8 JSON:

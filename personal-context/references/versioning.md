@@ -2,13 +2,14 @@
 
 Skill version and database Schema version are independent:
 
-- Skill version: `VERSION` (`0.8.0`)
+- Skill version: `VERSION` (`0.9.0`)
 - Current Schema: `1`
 - Minimum supported Schema: `1`
 - Maximum supported Schema: `1`
 - Consent notice: `2`
 - Provider contract: `1`
 - Artifact contract: `1`
+- Note Markdown contract: `1`
 - `qwen-mlx` profile: `4`
 - `qwen-mlx-3dspeaker` profile: `1` (experimental)
 
@@ -31,6 +32,8 @@ Skill 0.7.0 adds the explicit experimental `qwen-mlx-3dspeaker` profile. It keep
 Skill 0.7.1 upgrades `qwen-mlx` to profile 4 and adds a conservative ASR recovery policy. A normal 240-second chunk retains its profile-3 component identity and remains reusable. A chunk dominated by a catastrophic repeated-character run is regenerated as 30-second slices, checked again, aligned slice by slice and stored under a distinct recovery key. A still-pathological smaller slice fails before publication. Existing diarization and valid ASR/alignment sibling chunks remain reusable. Model revisions, runtime packages, Schema 1, provider/transcript contract 1, Artifact contract 1 and Consent Notice 2 remain unchanged, so no model download or database migration is required; the changed Provider profile requires a renewed bootstrap plan, consent receipt and runtime marker.
 
 Skill 0.8.0 adds a host-neutral semantic speaker review protocol in consented `agent-assisted` mode. The Provider creates private six-minute review windows from the unchanged cached assembly plus recording-local confidence; the Agent can return only medium/high-confidence assignments to speakers already present in that recording. A local validator binds decisions to the audio and review-input hashes and preserves every segment's text, timestamps, order and count. Review files are transient rather than a new artifact stage, and final delivery still uses the existing single Markdown renderer. `strict-local` rejects the review options. Schema 1, Provider/transcript contract 1, Artifact contract 1, both provider profiles, model/runtime locks and Consent Notice 2 remain unchanged, so existing databases, models, caches and valid consent receipts need no migration or reinstall.
+
+Skill 0.9.0 adds an explicitly requested recording-note delivery boundary. A consented `agent-assisted` host can organize an intact transcript and its associated immutable audio Source into one private Markdown draft; the local `publish-note` validator binds it to the exact audio and transcript hashes, protects manual edits, and publishes only `notes/<same-transcript-filename>.md`. Transcription-only requests still stop after the single `inbox` transcript, repeat note requests are idempotent, and note creation never reruns Provider stages or creates long-term Memory. New Vaults include `notes/`; existing Schema 1 Vaults create it lazily on first publication. Schema 1, Provider/transcript contract 1, Artifact contract 1, model/runtime locks and Consent Notice 2 remain unchanged, so no migration, consent renewal, model download or reinstall is required.
 
 ## Compatibility behavior
 

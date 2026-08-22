@@ -677,10 +677,11 @@ class PersonalContextTests(unittest.TestCase):
 
     def test_release_versions_keep_schema_and_transcript_contract_stable(self) -> None:
         versions = pc.version_info(None)
-        self.assertEqual(versions["skill_version"], "0.8.0")
+        self.assertEqual(versions["skill_version"], "0.9.0")
         self.assertEqual(versions["schema_version"], 1)
         self.assertEqual(versions["provider_contract_version"], 1)
         self.assertEqual(versions["artifact_contract_version"], 1)
+        self.assertEqual(versions["note_markdown_contract_version"], 1)
         self.assertEqual(versions["consent_notice_version"], 2)
         self.assertEqual(versions["qwen_mlx_profile_version"], 4)
         self.assertEqual(versions["qwen_mlx_3dspeaker_profile_version"], 1)

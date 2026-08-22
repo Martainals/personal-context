@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="Skill version 0.8.0" src="https://img.shields.io/badge/skill-0.8.0-0f766e?style=flat-square">
+  <img alt="Skill version 0.9.0" src="https://img.shields.io/badge/skill-0.9.0-0f766e?style=flat-square">
   <img alt="Schema version 1" src="https://img.shields.io/badge/schema-1-b7791f?style=flat-square">
   <img alt="Agent Skills open format" src="https://img.shields.io/badge/format-Agent%20Skills-334155?style=flat-square">
   <img alt="Python 3.9 or newer" src="https://img.shields.io/badge/core-Python%203.9%2B-334155?style=flat-square">
@@ -23,6 +23,7 @@
 - 提供显式、可回退的 3D-Speaker 离线人物实验选项，默认方案保持不变；
 - 在已许可的 Agent 辅助模式中，结合声音置信度与句子语义审核人物，本地验证后才发布；
 - 把正常录音交付为 Vault `inbox` 中唯一、完整、可读且防误覆盖的 Markdown；
+- 在明确请求后，复用逐字稿与关联录音生成可追溯笔记，并单独发布到 `notes`；
 - 将录音或文档变成不可变 Source、带时间的 Segment 与默认 Claim；
 - 审核 CandidateMemory 后才形成长期 Memory；
 - 以来源哈希、观察时间和录音时间范围检索、审计并重新编译 Wiki；
@@ -41,6 +42,7 @@
 | 模型环境不污染系统 | 私有 Python、虚拟环境、缓存和模型均位于用户配置目录 |
 | 转写中断不必从头开始 | 校验和保护的 JSON/gzip 阶段产物按录音和 Vault 隔离，损坏只重算对应分块 |
 | 内部 JSON 不污染 inbox | `transcript.v1` 只在私有临时 job 中连接 Provider 与数据库，成功或失败后均清理 |
+| 逐字稿与笔记不混放 | `inbox/` 只放逐字稿；显式请求的笔记以同名 Markdown 发布到 `notes/` |
 | 原始证据不可静默修改 | Source 按 SHA-256 寻址；Source 与 Segment 受 SQLite 触发器保护 |
 | “某人说过”不等于“事实” | 每个语音 Segment 默认形成 `Claim` |
 | 采集不等于形成长期记忆 | 只有显式 `approve` 才创建 `Memory` |
@@ -164,6 +166,30 @@ Markdown 包含标题、完整状态、总时长、人物标签与按 `HH:MM:SS`
 
 Vault 会在 `blobs/` 中保留一份不可变原音频；系统不会删除或移动用户提供位置的原件。
 
+## 明确要求生成录音笔记之后
+
+单独要求转写时不会自动产生笔记。只有用户明确要求“总结”“归纳”“生成笔记”或同时要求“转写并整理成笔记”时，Agent 才进入笔记流程。已有完整逐字稿会直接复用，不重新运行 ASR、逐词对齐、人物识别或组装。
+
+先进行只读预检：
+
+```bash
+./personal-context/scripts/context publish-note \
+  --root "$CONTEXT_ROOT" \
+  --transcript "$CONTEXT_ROOT/inbox/2026-01-02 03：04：05-内容标题.md" \
+  --check-only
+```
+
+在已许可的 `agent-assisted` 模式中，Agent 根据返回的确切逐字稿和关联原录音，在 Vault 之外生成一份私有 Markdown 草稿，再交给本地程序校验发布：
+
+```bash
+./personal-context/scripts/context publish-note \
+  --root "$CONTEXT_ROOT" \
+  --transcript "$CONTEXT_ROOT/inbox/2026-01-02 03：04：05-内容标题.md" \
+  --draft /private/path/note-draft.md
+```
+
+最终结果只出现在 `notes/`，并与逐字稿使用完全相同的文件名。完整性标记把笔记同时绑定到原录音和确切逐字稿版本；重复执行默认返回现有笔记，只有用户明确要求重新生成时才使用 `--rerun`。人工修改后的笔记不会被静默覆盖。笔记是派生阅读视图，不自动生成 CandidateMemory 或长期 Memory；在 `strict-local` 模式中，Agent 不读取逐字稿生成总结。
+
 人数默认自动判断，不需要询问用户；只有用户主动明确人数时才传 `--speaker-count 1..4`。已录完的文件默认使用高上下文 Sortformer 配置，再依据整段录音的置信度统一说话人通道、清除短暂跳变并组装发言轮次。
 
 对长录音人物错分做诊断时，可以先生成 `--provider qwen-mlx-3dspeaker` 的许可计划。该实验方案复用原有 Qwen 文字与逐词时间戳，在独立 Torch 环境中整段聚类人物；人物模型或运行环境变化只让人物阶段与最终组装失效，不会重新计算 ASR 或对齐。它不会被 `auto` 选中，也不能在没有新计划和许可的情况下静默替换默认值。
@@ -238,6 +264,7 @@ Vault 由用户选择，是唯一权威数据层：
 ├── context.sqlite3
 ├── blobs/          # 不可变 Source
 ├── inbox/          # 正常录音交付：每段录音一个完整 Markdown
+├── notes/          # 明确请求后生成：与逐字稿同名的笔记 Markdown
 ├── wiki/           # 可重建阅读视图
 └── backups/
 ```
@@ -255,21 +282,22 @@ Vault 由用户选择，是唯一权威数据层：
 ./personal-context/scripts/context storage-status --root "$CONTEXT_ROOT"
 ```
 
-缓存状态会显示录音名、Source ID、阶段数量、大小、最近写入时间和完整性；没有 Source 的残留缓存会标记为 `unbound`，但不会返回正文。缓存命令可加 `--audio /path/to/recording.m4a` 或 `--source-id <id>` 选择一条录音。`storage-status` 汇总原音频、数据库、Inbox、缓存、运行环境和已知临时残留的元数据。产物使用 JSON/gzip 与 SHA-256 校验，不使用 pickle，不保存声纹、说话人 embedding 或聚类中心。
+缓存状态会显示录音名、Source ID、阶段数量、大小、最近写入时间和完整性；没有 Source 的残留缓存会标记为 `unbound`，但不会返回正文。缓存命令可加 `--audio /path/to/recording.m4a` 或 `--source-id <id>` 选择一条录音。`storage-status` 汇总原音频、数据库、Inbox、Notes、缓存、运行环境和已知临时残留的元数据。产物使用 JSON/gzip 与 SHA-256 校验，不使用 pickle，不保存声纹、说话人 embedding 或聚类中心。
 
 ## 版本与维护
 
 | 项目 | 当前值 |
 |---|---|
-| Skill | `0.8.0` |
+| Skill | `0.9.0` |
 | SQLite Schema | `1` |
 | Consent notice | `2` |
 | Provider contract | `1` |
 | Artifact contract | `1` |
+| Note Markdown contract | `1` |
 | qwen-mlx profile | `4` |
 | qwen-mlx-3dspeaker profile | `1`（实验） |
 
-0.8.0 在已许可的 `agent-assisted` 模式中增加受约束的语义人物审核：本地声音结果与句子上下文会以私有临时协议交给已授权 Agent，Agent 只能调整录音内已有人物标签；正文、时间、顺序和片段数由本地程序强制保持。Inbox 仍只发布一份原格式 Markdown。没有新模型、新持久缓存或数据库迁移，既有缓存、模型与许可仍然有效。
+0.9.0 增加显式触发的录音笔记交付层：Agent 在许可范围内结合完整逐字稿和关联录音生成私有草稿，本地程序校验来源、标题和完整性后，只向 `notes/` 发布与逐字稿同名的 Markdown。单独转写仍只生成 `inbox` 逐字稿；重复执行不堆积文件，人工修改不被覆盖，也不会自动形成长期记忆。没有数据库迁移、模型下载、模型重装或许可更新。
 
 项目根目录的 [`AGENTS.md`](./AGENTS.md) 是后续 Agent 开发和升级的唯一维护章程。`CLAUDE.md`、`GEMINI.md` 只引用它，避免多份规则漂移；Codex 的 `personal-context/agents/openai.yaml` 仅是可选界面元数据。
 
@@ -299,6 +327,7 @@ PYTHONPYCACHEPREFIX=/tmp/personal-context-pycache \
 │   │   ├── personal_context.py
 │   │   ├── personal_context_bootstrap.py
 │   │   ├── transcript_markdown.py
+│   │   ├── note_markdown.py
 │   │   └── providers/
 │   │       ├── qwen_mlx.py
 │   │       ├── diarization_3dspeaker.py
